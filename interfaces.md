@@ -59,3 +59,27 @@ test, not by `get` itself — callers must not assume truncation).
 
 No public command-description helper beyond `help_text` was required by the
 contract for this module.
+
+## crypto.py
+
+Fernet symmetric encryption/decryption of Todoist tokens, keyed by
+`config.SECRET_KEY`. No module-level side effects — `Fernet` is instantiated
+inside each function call, not cached at import time.
+
+**encrypt_token(plain: str) → str**
+- Fernet-encrypts `plain` using `config.SECRET_KEY`, returns the base64
+  ciphertext as `str`
+- On any failure (including non-`str` input), raises `ValueError` with a
+  fixed descriptive message — never the raw `cryptography` exception, never
+  includes `plain` in the message
+- Output differs from `plain` and is non-deterministic across calls (random
+  IV/nonce per Fernet encryption)
+
+**decrypt_token(encrypted: str) → str**
+- Decrypts a Fernet ciphertext produced by `encrypt_token`, returns the
+  original plain `str`
+- On any failure (invalid/corrupted ciphertext, wrong key, etc.), raises
+  `ValueError` with a fixed descriptive message — never `InvalidToken` or any
+  other raw `cryptography` exception, and never includes the plain token in
+  the message
+- Callers (`bot.py`) catch `ValueError` specifically to send `decrypt_error`
