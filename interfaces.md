@@ -337,3 +337,102 @@ a `total` keyword on `Timeout` (`TypeError: unexpected keyword argument
 (positional) is used instead, which sets connect/read/write/pool all to
 10 seconds — the same intent ("10s total for full SSE receipt") expressed
 in the form this `httpx` version actually supports.
+
+## llm.py
+
+Orchestration core. Returns plain answer strings only — no Telegram
+knowledge. Calls `db` and `mcp` via plain module attribute access
+(`import db` / `import mcp`) so tests can overwrite `llm.db.*` / `llm.mcp.*`
+wholesale with mocks (no real Postgres or network needed for
+`tests/test_llm.py` at all). Also imports `config` and `messages`. Does
+**not** import `logger` directly — all of `llm.py`'s structured logging
+(`llm_call`, `tool_call`, `rate_limit`, `bot_response`, and tool-failure
+`ERROR`s) goes through `db.log(user_id, level, event, data)`, which
+persists to the Postgres `logs` table (and internally calls
+`logger.sanitize` + `logger.log_stdout`) — required so these events are
+queryable by the Grafana dashboards described in the spec's Log Events
+table. **Flagged resolution (user-confirmed 2026-06-23, no blocking
+ambiguity left):** this task's own interface list named only
+`logger.log_stdout` as available and omitted `db.log` from the `db.py`
+function list it gave — unlike every other `db.py` function this module
+uses — which conflicted with the technical spec's Log Events table (which
+maps these exact event names onto the `logs` table) and with `db.log`
+already being implemented/tested in [[db.py]]. Resolved in favor of
+`db.log` so events actually reach Grafana; treated the task file's
+omission as an oversight.
+
+**Public**
+- `process_message(user_id: int, user_text: str, token: str, language: str, turn_start: datetime) -> str`
+  (async) — `turn_start` must be the exact timezone-aware `datetime` the
+  caller (`bot.py`) captured after lock acquisition; every cleanup call
+  inside this function passes that same object through unchanged (never a
+  freshly generated timestamp) — verified by identity (`is`), not just
+  equality, in `tests/test_llm.py`. Step order matches the contract exactly:
+  `db.get_history` → build system message → build user message → ALWAYS
+  `db.save_user_message` (before any LLM call, including all early-return
+  paths) → `mcp.get_tools` → first LLM call (`tool_choice="auto"`, 30s
+  timeout) → no-tool-calls path (`db.save_turn` once, return answer) or
+  tool-calls path (execute every tool call via `mcp.call_tool` +
+  `db.save_tool_result`, second LLM call, `db.save_turn` once, return
+  answer). On `mcp.call_tool` failure or `db.save_tool_result` failure:
+  logs `tool_call` at ERROR, calls `db.delete_turn_tool_results(user_id,
+  turn_start)`, returns `messages.get("tool_failure", language)` —
+  remaining tool calls in that turn are skipped, `db.save_turn` is never
+  reached. On HTTP 429 from either LLM call: logs `rate_limit` at WARNING
+  (never ERROR) and returns `rate_limit_session`/`rate_limit_week`
+  (selected by the `X-Window` response header; anything other than the
+  literal string `"week"` is treated as `"session"`); the *second*-call 429
+  path additionally calls `delete_turn_tool_results` first (the first-call
+  429 path does not, since no tool results exist yet to clean up). On
+  `httpx.TimeoutException` from either LLM call: returns `llm_timeout`
+  (logged at WARNING via the `llm_call` event with `error: "timeout"`); the
+  second-call path additionally calls `delete_turn_tool_results` first.
+  `db.save_user_message` always happens; the error message itself is never
+  saved to history (Rule 14).
+
+**Private helpers** (no public wrapper needed solely for these, so they're
+unit-tested directly):
+- `_build_system_message(language: str) -> dict` — `{"role": "system",
+  "content": ...}`. Template selected from module-level `_SYSTEM_PROMPTS`
+  (`"en"`/`"ru"`, **not** in `messages.py` — the brief's file tree
+  explicitly assigns system-prompt ownership to `llm.py`, and these strings
+  are never shown to the user or stored, so `messages.py`'s
+  user-facing-string rule doesn't apply). Unknown language silently falls
+  back to `"en"`, consistent with `messages.get`'s own fallback. Date comes
+  from `_today_str()`.
+- `_today_str() -> str` — `datetime.now(timezone.utc).strftime("%Y-%m-%d")`,
+  factored out specifically so tests can `monkeypatch.setattr(llm,
+  "_today_str", lambda: "...")` instead of subclassing `datetime`.
+- `_strip_thinking(text: str | None) -> str | None` — depth-counting scan
+  that removes everything between `<think>` and `</think>`, including
+  nested blocks (tracks `depth`, skips characters while `depth > 0`) and
+  incomplete/unclosed blocks (an opening tag with no matching close
+  consumes the rest of the string, since nothing reliable follows
+  half-finished reasoning). A stray `</think>` with no prior `<think>` is
+  silently dropped without raising `depth` below zero. Passes `None`
+  through unchanged (needed because `content` is `null` on the
+  tool-calling turn of a response). **Always active** — `test_qwen_tools.py`
+  was never run/recorded in this repo to confirm Qwen actually emits
+  `<think>` blocks (the contract gates this feature on that script's
+  result), and the user confirmed (2026-06-23) to implement it
+  unconditionally rather than skip it; safe no-op on plain text.
+- `_format_retry_time(seconds: int) -> str` — turns a `Retry-After` second
+  count into a compact human string (`"1d 1h"`, `"45s"`, etc.) for the
+  `retry_time` kwarg of `rate_limit_session`/`rate_limit_week`. Not
+  specified by the contract beyond "the value appears in the message" —
+  this exact format is this implementation's own choice.
+- `_extract_token_count(payload: dict) -> int | None` — `payload["usage"]
+  ["total_tokens"]` if `usage` is present and truthy, else `None`.
+- `_call_llm(messages_payload: list[dict], tools: list) -> tuple[httpx.Response, float]`
+  (async) — POSTs to `f"{config.NEURALDEEP_API_URL}/chat/completions"`
+  with `{"model": _MODEL, "messages": ..., "tools": ..., "tool_choice":
+  "auto"}` under `httpx.AsyncClient(timeout=_LLM_TIMEOUT)` (30s, plain
+  `httpx.Timeout(30.0)` positional form — see the [[mcp.py]] deviation
+  note on why `total=` isn't used here either). Returns the raw
+  `httpx.Response` (not pre-parsed JSON) plus latency in milliseconds, so
+  the caller can branch on `status_code == 429` before ever calling
+  `.json()`. Module constant `_MODEL = "Qwen3.6-35b-a3b"` per the brief's
+  Tech Stack table — no env var for this; it isn't part of `config.py`'s
+  contract.
+- `_handle_rate_limit(user_id: int, response: httpx.Response, language: str) -> str`
+  (async) — shared by both the first- and second-call 429 branches.
