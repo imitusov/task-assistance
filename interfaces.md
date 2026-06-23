@@ -83,3 +83,42 @@ inside each function call, not cached at import time.
   other raw `cryptography` exception, and never includes the plain token in
   the message
 - Callers (`bot.py`) catch `ValueError` specifically to send `decrypt_error`
+## language.py
+
+`DetectorFactory.seed = 0` set at import for determinism. No internal
+dependencies.
+
+**Constants:**
+- `SUPPORTED_LANGUAGES: set[str]` = `{"en", "ru"}`
+- `DEFAULT_LANGUAGE: str` = `"en"`
+- `MIN_DETECTION_LENGTH: int` = `10`
+- `MIN_DETECTION_CONFIDENCE: float` = `0.9` (documented contract value —
+  see deviation note below)
+
+**detect(text: str) → str**
+Returns `"en"` or `"ru"` only. Returns `DEFAULT_LANGUAGE` on text shorter
+than `MIN_DETECTION_LENGTH`, an unsupported top result, low confidence, or
+any exception. Never raises.
+
+**resolve(stored_language: str | None, text: str) → tuple[str, bool]**
+- Raises `TypeError` if `text is None` — caller must never pass `None`.
+- Empty string `stored_language` treated identically to `None`.
+- `None`/empty stored → `(detect(text), True)`.
+- `len(text) < MIN_DETECTION_LENGTH` with a truthy stored value → `(stored, False)`
+  (too short to justify a switch — stored value is preserved even if it
+  differs from `detect()`'s default).
+- Otherwise, detected == stored → `(stored, False)`; detected != stored →
+  `(detected, True)`.
+- Never raises except the documented `TypeError`.
+
+**Deviation from literal contract (flagged and approved by user 2026-06-23):**
+The contract specifies gating `detect()` on `MIN_DETECTION_CONFIDENCE = 0.9`
+using langdetect's top-candidate probability. In practice, langdetect's
+probability for short-but-correct supported-language text (e.g. ~0.71 for
+the contract's own Russian test phrase) is regularly below 0.9, so a literal
+0.9 gate would default that text to EN and fail the contract's own test
+case. Resolution: `detect()` internally gates on a lower, undocumented
+threshold (`_CONFIDENCE_GATE = 0.6`, private) instead of the public
+`MIN_DETECTION_CONFIDENCE` constant. `MIN_DETECTION_CONFIDENCE` remains
+defined at `0.9` to satisfy the contract's constant requirement but is not
+used as the actual gate value in `detect()`.
