@@ -187,3 +187,94 @@ are `TIMESTAMPTZ`, never naive; `downgrade base` leaves only Alembic's own
 
 `db.py` (module 7) and `tests/test_db.py` can rely on this exact shape —
 no other schema exists.
+
+## db.py
+
+Single data-access layer; all SQL lives here. Depends on `config`
+(`DATABASE_URL`, `MAX_HISTORY_MESSAGES`) and `logger` (`sanitize`,
+`log_stdout`) — calls them via `import config` / `import logger` (module
+attribute access, not `from x import y`), so tests can `patch("db.logger.log_stdout")`
+and `patch("db.asyncpg.create_pool")`. Module-level `_pool: asyncpg.Pool | None`,
+`None` until `init_pool()` runs.
+
+**Pool lifecycle**
+- `init_pool() -> None` (async) — `asyncpg.create_pool(dsn=config.DATABASE_URL,
+  min_size=2, max_size=10)`. Raises whatever `asyncpg.create_pool` raises —
+  does not catch or wrap. Caller (per Rule 12) must catch, log, exit non-zero.
+- `close_pool() -> None` (async) — closes `_pool` and resets it to `None`.
+  Safe to call when `_pool` is already `None` (no-op).
+
+**Users**
+- `get_user(user_id: int) -> dict | None` — `dict` keys: `telegram_user_id`,
+  `todoist_token`, `language`, `created_at`, `last_active_at`. `None` if no row.
+- `save_user(user_id: int, encrypted_token: str, language: str) -> None` —
+  upsert on `telegram_user_id`; conflict path updates `todoist_token`,
+  `language`, `last_active_at` (`NOW()`); `created_at` only set on insert.
+- `update_language(user_id: int, language: str) -> None` — updates `language`
+  and `last_active_at`; leaves `todoist_token` untouched.
+- `touch_user(user_id: int) -> None` — updates only `last_active_at`.
+- `get_all_users() -> list[dict]` — same row shape as `get_user`, all rows.
+  Key-rotation script only.
+- `update_token(user_id: int, encrypted_token: str) -> None` — updates only
+  `todoist_token`. Key-rotation script only.
+
+**Conversations** (`content`/`data` stored as JSONB via explicit
+`json.dumps(...)::jsonb` casts on write and `json.loads(...)` on read — no
+asyncpg jsonb codec is registered, so this is independent of how a
+connection was created; test fixtures don't need extra codec setup)
+- `get_history(user_id: int) -> list[dict]` — `content` objects only,
+  `created_at ASC, id ASC` order, excludes `role = "system"`. `[]` if none.
+- `save_user_message(user_id: int, content: dict) -> None` — inserts a row
+  with `role = content["role"]`. Never trims.
+- `save_turn(user_id: int, assistant_content: dict) -> None` — inserts a row
+  with `role = assistant_content["role"]`, then inside the **same**
+  `conn.transaction()` deletes all but the most recent
+  `config.MAX_HISTORY_MESSAGES` rows for that `user_id` (tie-broken by `id`
+  for determinism when `created_at` collides — Postgres freezes `NOW()` for
+  the duration of a transaction, so rapid inserts inside one transaction can
+  share a timestamp). The only place trimming happens.
+- `save_tool_result(user_id: int, tool_content: dict) -> None` — inserts a
+  row with `role = tool_content["role"]`. Never trims.
+- `delete_turn_tool_results(user_id: int, since: datetime) -> None` —
+  deletes `role = "tool"` rows where `created_at >= since` (inclusive by
+  design). Safe with zero matching rows.
+  **Deviation from literal contract (flagged, no blocking ambiguity —
+  documented here per the project's established deviation-handling
+  precedent, see [[language.py]]):** the contract says "asyncpg rejects
+  naive datetimes for TIMESTAMPTZ." Verified empirically against asyncpg
+  0.31.0 — it does **not** reject them; a naive `datetime` is silently
+  interpreted as local time and inserted without error. To satisfy the
+  contract's required *behavior* ("passing naive datetime raises"),
+  `delete_turn_tool_results` explicitly raises `ValueError` itself when
+  `since.tzinfo is None`, rather than relying on asyncpg to do it.
+- `clear_user_history(user_id: int) -> int` — deletes all roles for the
+  user, returns the deleted row count (`0` if none existed).
+- `cleanup_old_conversations(days: int) -> int` — `WHERE created_at < NOW() -
+  make_interval(days => $1)`, integer bind param. Returns rows deleted.
+- `cleanup_old_logs(days: int) -> int` — same pattern over `logs`.
+
+**Logging**
+- `log(user_id: int | None, level: str, event: str, data: dict) -> None` —
+  sanitizes `data` via `logger.sanitize` before inserting into `logs`; the
+  insert is wrapped in `try/except Exception: pass` (Rule 2 — DB log
+  failures never propagate). `logger.log_stdout(level, event, user_id, data)`
+  is then called **unconditionally** (success or failure) with the
+  *original*, unsanitized `data` — `log_stdout` does its own sanitization
+  internally per its own contract, so this is not a double-redaction bug.
+
+**Content structure** (`role` column always equals `content["role"]`,
+enforced by callers, not by `db.py`):
+- user: `{"role": "user", "content": "string"}`
+- assistant (text): `{"role": "assistant", "content": "string"}`
+- assistant (tool call): `{"role": "assistant", "content": null, "tool_calls": [...]}`
+- tool: `{"role": "tool", "tool_call_id": "string", "content": "string"}`
+
+**Test infra note for future modules' tests:** `tests/test_db.py` requires
+`TEST_DATABASE_URL` (real Postgres, never production) and skips entirely if
+unset. A session-scoped autouse fixture runs `alembic upgrade head` /
+`downgrade base` once for the whole session. Each test gets its own
+`asyncpg.connect()` wrapped in a manually-started transaction that is
+rolled back in teardown; `db._pool` is monkeypatched to a tiny
+`_SingleConnPool` wrapper whose `acquire()` yields that same connection
+(no real pool, no release/commit) so all queries in a test stay inside the
+one rolled-back transaction.
