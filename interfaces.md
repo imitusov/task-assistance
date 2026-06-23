@@ -628,3 +628,71 @@ test's own `await asyncio.sleep(...)` calls get redirected too; prefer
 patching a small `_KEEP_TYPING_INTERVAL_SECONDS`-style module constant
 instead of `asyncio.sleep` itself when the test also needs real scheduling
 yields (as `_keep_typing`'s test does).
+
+## scripts/rotate_key.py
+
+Offline operator CLI, run during bot downtime — module 11 of 11, the last.
+Calls `db` via plain module attribute access (`import db`) so tests
+overwrite `rotate_key.db.*` wholesale with mocks (no real Postgres needed).
+Does **not** import `logger.py` or `crypto.py` — deliberate, not an
+oversight: `crypto.py`'s functions are hardwired to `config.SECRET_KEY` and
+can't take the CLI's `--old-key`/`--new-key`, so this is the one sanctioned
+place in the project that calls `cryptography.fernet.Fernet` directly; and
+this script's output is plain `print()` (per-batch progress, final summary,
+failure lines), not the structured JSON `logger.log_stdout`/`db.log`
+pipeline the live bot uses — there's no Grafana-facing reason for an
+offline rotation run to emit structured log events.
+
+**Two contract deviations, maintainer-confirmed 2026-06-24 (see the task
+file's "RESOLVED" section for the full reasoning — not re-litigated here):**
+1. Keys come from the CLI via direct `Fernet(old_key.encode())` /
+   `Fernet(new_key.encode())`, never via `crypto.encrypt_token`/
+   `decrypt_token`.
+2. No atomic "single transaction per batch with rollback" — `db.update_token`
+   has no shared-transaction handle and extending `db.py` was out of scope.
+   A "batch" is a progress/error-isolation grouping only: each
+   `update_token` call commits independently, and a failing row is
+   logged-and-skipped, not rolled back together with its batch.
+
+**Public**
+- `main(argv: list[str] | None = None) -> None` (sync) — parses args via
+  `_parse_args`, then `asyncio.run(rotate(args.old_key, args.new_key))`.
+  Entry point for `python -m scripts.rotate_key --old-key ... --new-key ...`
+  (also runnable as a script via the `if __name__ == "__main__":` guard).
+  Missing `--old-key`/`--new-key` → `argparse` prints a usage error and
+  raises `SystemExit` with a non-zero code on its own (no custom handling
+  needed). **Test note:** `main()` must be called from a *synchronous* test
+  — it calls `asyncio.run()` internally, which raises `RuntimeError` if
+  invoked from inside an already-running event loop (e.g. from an
+  `async def` test under `pytest-asyncio`).
+- `rotate(old_key: str, new_key: str) -> tuple[int, int]` (async) — the
+  actual rotation entry point tests call directly (bypassing argparse).
+  Returns `(total_succeeded, total_failed)`. Sequence: `db.init_pool()` →
+  (inside `try`) `db.get_all_users()` → split into `BATCH_SIZE`-sized
+  (`50`) chunks → `_process_batch` per chunk, printing one `"Batch
+  i/n: X succeeded, Y failed"` line after each → (inside `finally`)
+  `db.close_pool()` — called even if `get_all_users()` itself raises (that
+  exception still propagates after cleanup; it isn't a "per-user" failure
+  the contract asks to isolate). Prints a final `"Done. Succeeded: X,
+  Failed: Y"` line after the loop. Empty user list → zero batches, no
+  `"Batch"` lines, summary still prints `0`/`0`.
+
+**Private helpers:**
+- `_parse_args(argv: list[str] | None = None) -> argparse.Namespace` —
+  `--old-key`/`--new-key`, both `required=True`.
+- `_rotate_token(encrypted_old: str, old_fernet: Fernet, new_fernet: Fernet) -> str`
+  — decrypt under `old_fernet`, re-encrypt under `new_fernet`. Raises
+  whatever `Fernet.decrypt`/`encrypt` raises (e.g. `InvalidToken`) on bad
+  input — caught by the caller, not here.
+- `_process_batch(batch: list[dict], old_fernet: Fernet, new_fernet: Fernet) -> tuple[int, int]`
+  (async) — per user in the batch: `_rotate_token` + `db.update_token`
+  wrapped in one broad `try/except Exception` (intentional — this is the
+  one place in the project where a blanket catch-and-continue is the
+  contract-mandated behavior, not a violation of the "don't catch silently"
+  rule, since every failure is printed with the `user_id` and a full
+  traceback via `traceback.print_exc()` before moving on). Never raises;
+  returns `(succeeded, failed)` counts for that batch. Never prints
+  `user["todoist_token"]` or either key — only `user_id` and the caught
+  exception's own traceback, which Fernet's exceptions don't populate with
+  key/token material.
+- `BATCH_SIZE = 50` (module constant).
