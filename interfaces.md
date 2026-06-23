@@ -29,6 +29,12 @@ silently defaulted.
 - `CONVERSATION_RETENTION_DAYS: int` — default `7`
 - `LOG_RETENTION_DAYS: int` — default `30`
 
+**Optional (str, with defaults):**
+- `LLM_MODEL: str` — default `"qwen3.6-35b-a3b"` (lowercase — NeuralDeep keys
+  reject the capitalised `Qwen3.6-35b-a3b` with HTTP 401; consumed by `llm.py`)
+- `MCP_SERVER_URL: str` — default `"https://ai.todoist.net/mcp"` (consumed by
+  `mcp.py` as `MCP_ENDPOINT`)
+
 All modules must import these names from `config` — never read
 `os.environ` directly.
 
@@ -281,9 +287,10 @@ one rolled-back transaction.
 
 ## mcp.py
 
-Client for the official Todoist MCP server (`https://ai.todoist.net/mcp`,
-module constant `MCP_ENDPOINT`). Depends only on `config` (`MCP_TOOLS_TTL`,
-read fresh on every `get_tools` call, not cached at import) — does **not**
+Client for the official Todoist MCP server. The endpoint is module constant
+`MCP_ENDPOINT = config.MCP_SERVER_URL` (default `https://ai.todoist.net/mcp`,
+read once at import). Depends only on `config` (`MCP_SERVER_URL` at import;
+`MCP_TOOLS_TTL` read fresh on every `get_tools` call, not cached at import) — does **not**
 import `db.py` or `logger.py` (the contract listed `logger` as available
 but the module ended up not needing it: no failure path here is swallowed
 or logged internally — every failure is a raised exception for the caller,
@@ -431,8 +438,193 @@ unit-tested directly):
   note on why `total=` isn't used here either). Returns the raw
   `httpx.Response` (not pre-parsed JSON) plus latency in milliseconds, so
   the caller can branch on `status_code == 429` before ever calling
-  `.json()`. Module constant `_MODEL = "Qwen3.6-35b-a3b"` per the brief's
-  Tech Stack table — no env var for this; it isn't part of `config.py`'s
-  contract.
+  `.json()`. Module constant `_MODEL = config.LLM_MODEL`
+  (default `"qwen3.6-35b-a3b"`, read once at import). Note: the name is
+  lowercase — the capitalised `Qwen3.6-35b-a3b` from the brief's Tech Stack
+  table is rejected by NeuralDeep keys with HTTP 401 (verified via
+  `test_qwen_tools.py`); overridable via the `LLM_MODEL` env var.
 - `_handle_rate_limit(user_id: int, response: httpx.Response, language: str) -> str`
   (async) — shared by both the first- and second-call 429 branches.
+
+## bot.py
+
+Entry point and Telegram layer. Calls `db`, `mcp`, `llm` via plain module
+attribute access (`import db` / `import mcp` / `import llm`) so tests
+overwrite `bot.db.*` / `bot.mcp.*` / `bot.llm.*` wholesale with mocks — no
+real Postgres, MCP, or LLM network calls needed for `tests/test_bot.py` at
+all (only the Todoist token-validation HTTP call is separately mocked via
+`bot.httpx.AsyncClient`). Also imports `config`, `crypto`, `language`,
+`logger`, `messages`. Standardizes on `context.bot.send_message(chat_id=...,
+text=...)` for every outgoing message in every handler (never
+`update.message.reply_text(...)`) — deliberate, since the token-input
+handler deletes the user's message before responding, and replying to an
+already-deleted message is unreliable; using direct `send_message`
+everywhere keeps the pattern uniform across the whole module.
+
+**State constants:** `STATE_NORMAL = "NORMAL"`, `STATE_AWAITING_TOKEN =
+"AWAITING_TOKEN"`, `STATE_AWAITING_RESET = "AWAITING_RESET"`. Stored in
+`context.user_data["state"]` (absent == `STATE_NORMAL`). Per-user lock in
+`context.user_data["lock"]` (`_get_lock(context)` —
+`context.user_data.setdefault("lock", asyncio.Lock())`).
+
+**Handlers** (all: `_reject_if_group` first, then lock-contention check,
+then `await lock.acquire()` / `try` / `finally: lock.release()`):
+- `message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None`
+  (async) — registered against `filters.TEXT & ~filters.COMMAND`. Lock
+  contention → discard silently (no message sent), unlike the command
+  handlers. Captures `turn_start = datetime.now(timezone.utc)` immediately
+  after acquiring the lock, before any other work, and passes that exact
+  object through to `llm.process_message` unchanged. Delegates the bulk of
+  the step-by-step contract to the private `_process_message` so the
+  lock/`finally` wrapper stays trivial and easy to verify independently of
+  the business logic inside it.
+- `start_command`, `token_command`, `reset_command`, `refresh_command`,
+  `help_command` — same `(update, context) -> None` signature. Lock
+  contention → `messages.get("please_wait", context.user_data.get(
+  "detected_language", "en"))` (the only language source available before
+  any `db.get_user` call has happened). Behavior matches the Command
+  Handlers table in the technical spec exactly (see task file for the
+  per-command table; not duplicated here to avoid drift — this module's
+  docstring-equivalent is the function bodies themselves, which are short).
+
+**Private helpers:**
+- `_is_private(update) -> bool` — `update.effective_chat.type == "private"`.
+- `_reject_if_group(update, context) -> bool` (async) — sends
+  `group_chat_rejected` (always in `"en"` — no user/language context exists
+  yet at this point) and returns `True` if not private; callers `return` on
+  `True`.
+- `_looks_like_token(text: str) -> bool` — `^[a-zA-Z0-9]{40}$` on
+  `text.strip()`. Heuristic for "user pasted their token without /token
+  first," not the actual Todoist validation (that's `_handle_token_input`'s
+  job).
+- `_process_message(update, context, turn_start)` (async) — the step
+  5-15 body of the message handler contract, run while the lock from
+  `message_handler` is already held. Routes to `_handle_token_input` if
+  state is `AWAITING_TOKEN`; otherwise: `db.get_user` (exception → `db_error`
+  in `language.detect(text)`; `None` → `unregistered` in
+  `language.detect(text)`) → `AWAITING_RESET` branch (stored language,
+  `"confirm"` case-insensitive/stripped → `db.clear_user_history`,
+  `reset_confirmed`/`reset_confirmed_empty` by count, else
+  `reset_cancelled`; state → `NORMAL`; return either way) →
+  `language.resolve` (+ `update_language` or `touch_user`) → accidental-token
+  check (deletes the message, swallowing any deletion error silently — no
+  `token_deletion_failed` here, that message is specific to
+  `_handle_token_input`'s own deletion step) → `crypto.decrypt_token`
+  (`ValueError` → `decrypt_error`) → keep-typing task → `llm.process_message`
+  → `_cancel_keep_typing` (always, via `finally`) → `_send_with_truncation`.
+- `_handle_token_input(update, context)` (async) — lock already held by
+  the caller (`message_handler`/`_process_message`), does not touch the
+  lock itself. Language: `context.user_data.get("detected_language")`,
+  falling back to `language.detect(text)` if absent (never an explicit
+  `"en"` branch — `language.detect` already defaults there on its own).
+  Deletes the token message first (failure → sends
+  `token_deletion_failed` but **continues**, does not return). Validates
+  via `GET https://api.todoist.net/rest/v2/projects` with
+  `Authorization: Bearer <plain_token>` (10s timeout): network exception
+  (`httpx.HTTPError`) → `token_network_error`, state untouched (stays
+  `AWAITING_TOKEN`); non-200 → `token_invalid`, state untouched. On success:
+  loads the existing user (if any) and evicts its **old** plaintext token
+  from the MCP cache (`crypto.decrypt_token` + `mcp.evict_cache`, swallowing
+  `ValueError` if the stored ciphertext is somehow corrupt) *before*
+  encrypting and saving the new one — `mcp.evict_cache` is always called
+  with the OLD token, never the new one. Then `crypto.encrypt_token` →
+  `db.save_user` → state → `NORMAL` → `db.log(user_id, "INFO", "new_user",
+  {"language": lang})` → `context.user_data.pop("detected_language", None)`
+  → `token_accepted`.
+- `_send_or_wait(update, context) -> bool` (async) — shared lock-contention
+  check for all five command handlers; sends `please_wait` and returns
+  `True` if contended (caller returns immediately), else returns `False`
+  without touching the lock (the caller acquires it right after).
+- `_split_into_chunks(text: str, limit: int = 4096) -> list[str]` — pure,
+  synchronous. Greedily finds the rightmost `\n\n` at or before `limit` in
+  the remaining text; if none, the rightmost single `\n`; if neither, hard
+  `limit`-char cut. The matched separator is consumed (not duplicated at
+  the start of the next chunk or left dangling at the end of the current
+  one). Repeats until what's left fits in one chunk.
+- `_send_with_truncation(telegram_bot, chat_id: int, text: str, lang: str) -> None`
+  (async) — note the signature takes `telegram_bot` as an explicit first
+  parameter (the contract's prose listed only `(chat_id, text, lang)`, but
+  the function obviously needs a bot instance to call `send_message` on; a
+  module-level global bot reference was considered and rejected as worse
+  for testability — callers pass `context.bot` explicitly instead). Sends
+  each chunk from `_split_into_chunks` via `telegram_bot.send_message`; on
+  the first chunk-send failure, attempts one direct `send_message` with
+  `messages.get("send_error", lang)` and then **stops** (does not attempt
+  remaining chunks); if that fallback also fails, logs via
+  `logger.log_stdout("ERROR", "send_error", None, {"chat_id": chat_id})`
+  and returns — never raises.
+- `_keep_typing(telegram_bot, chat_id: int) -> None` (async) — infinite loop:
+  `send_chat_action(TYPING)` then `asyncio.sleep(4)`; re-raises
+  `asyncio.CancelledError` (so the awaiting `_cancel_keep_typing` sees it).
+- `_cancel_keep_typing(task: asyncio.Task | None) -> None` (async) —
+  no-op if `task` is `None`; otherwise `task.cancel()` then `await task`
+  inside a `try`/`except asyncio.CancelledError: pass`, so callers never
+  need their own try/except around this.
+
+**Background tasks:**
+- `_heartbeat(start_time: float) -> None` (async) — infinite loop:
+  `asyncio.sleep(60)` **before** the first event (so the first heartbeat
+  log happens 60s after the task starts, not immediately), then
+  `db.log(None, "INFO", "heartbeat", {"status": "alive", "uptime_seconds":
+  int(time.monotonic() - start_time)})` wrapped in its own
+  `try/except Exception: pass` — a log failure never terminates the loop.
+  `start_time` is `time.monotonic()` captured at the very top of `main()`,
+  threaded through `application.bot_data["start_time"]` (set before
+  `post_init` runs) rather than a closure, so it's available inside
+  `_post_init` without any global state.
+- `_seconds_until_next_cleanup(now: datetime) -> float` — pure helper:
+  next `03:00 UTC` at or after `now` (today's 03:00 if still in the future,
+  else tomorrow's).
+- `_daily_cleanup() -> None` (async) — infinite loop: compute sleep via
+  `_seconds_until_next_cleanup(datetime.now(timezone.utc))`, sleep, then run
+  `db.cleanup_old_conversations(config.CONVERSATION_RETENTION_DAYS)` +
+  `db.cleanup_old_logs(config.LOG_RETENTION_DAYS)` inside one
+  `try/except Exception`: success → one `db.log(None, "INFO",
+  "daily_cleanup", {"deleted_conversations": ..., "deleted_logs": ...})`;
+  failure → one `db.log(None, "ERROR", "daily_cleanup", {"error": str(exc)})`
+  — **same event name** at a different level, per the contract's literal
+  "success → daily_cleanup INFO; failure → ERROR" phrasing (not a separate
+  generic `"error"` event for this particular task). Always
+  `asyncio.sleep(60)` after a run, success or failure, before recomputing
+  the next 03:00 target.
+
+**Startup/shutdown (`main()`):**
+- `main() -> None` (sync) — captures `start_time = time.monotonic()` first,
+  builds the `Application` with `.post_init(_post_init)` and
+  `.post_shutdown(_post_shutdown)`, stores `start_time` into
+  `application.bot_data["start_time"]`, registers the five
+  `CommandHandler`s and the text `MessageHandler`, then
+  `application.run_polling()`. SIGTERM/SIGINT registration is **not** done
+  manually — `Application.run_polling()` already installs signal handlers
+  for graceful shutdown by default in `python-telegram-bot` 21.x; adding a
+  second manual registration would risk conflicting with it.
+- `_post_init(application: Application) -> None` (async) — calls
+  `db.init_pool()`; on failure, logs via `logger.log_stdout("ERROR",
+  "error", None, {...})` and **re-raises** rather than calling
+  `sys.exit`/`os._exit` directly. An uncaught exception during PTB startup
+  aborts `run_polling()` and terminates the process with a non-zero exit
+  code on its own, which satisfies Rule 12 ("log stdout, exit non-zero")
+  without fragile process-termination calls inside an async callback. On
+  success, starts `_heartbeat`/`_daily_cleanup` as tasks stored in
+  `application.bot_data["heartbeat_task"]`/`["cleanup_task"]`.
+- `_post_shutdown(application: Application) -> None` (async) — cancels
+  both background tasks, then `await db.close_pool()` in a `finally` (PTB
+  itself handles "stop polling" as part of its own shutdown sequence before
+  calling this hook).
+
+**Test infra note for future modules' tests (none remain — this is module
+10 of 11, only `scripts/rotate_key.py` is left):** `tests/test_bot.py`
+needs a *valid* Fernet key for `SECRET_KEY` (not an arbitrary string) since
+`_make_user`'s fixture round-trips real `crypto.encrypt_token`/
+`decrypt_token` rather than mocking `crypto` — this caught a real bug
+class early (a plausible-looking but invalid key silently breaking every
+test that reaches the decrypt step) that a mocked `crypto` would have
+hidden. Background-task tests (`_heartbeat`, `_daily_cleanup`) drive the
+infinite loop via a fake `asyncio.sleep` that raises `CancelledError` after
+N calls to terminate it deterministically — note that patching
+`bot.asyncio.sleep` patches the *same* `asyncio` module object the test
+file itself imported (there's only one `asyncio` module per process), so a
+test's own `await asyncio.sleep(...)` calls get redirected too; prefer
+patching a small `_KEEP_TYPING_INTERVAL_SECONDS`-style module constant
+instead of `asyncio.sleep` itself when the test also needs real scheduling
+yields (as `_keep_typing`'s test does).
