@@ -445,6 +445,18 @@ unit-tested directly):
   `test_qwen_tools.py`); overridable via the `LLM_MODEL` env var.
 - `_handle_rate_limit(user_id: int, response: httpx.Response, language: str) -> str`
   (async) — shared by both the first- and second-call 429 branches.
+- `_run_llm_call(stage, messages_payload, tools, user_id, language, turn_start, cleanup_on_failure) -> tuple[dict | None, str | None]`
+  (async) — added during a post-implementation cleanup pass (2026-06-24) to
+  deduplicate `process_message`'s two near-identical LLM-call blocks
+  (timeout handling, 429 handling, success logging were repeated almost
+  verbatim for the `"tool_selection"` and `"answer_generation"` stages).
+  Wraps one `_call_llm` call: on success returns `(message, None)`; on
+  timeout or 429 returns `(None, early_return_answer)` after logging.
+  `cleanup_on_failure` is `False` for the first call (nothing to clean up
+  yet) and `True` for the second (calls `db.delete_turn_tool_results(
+  user_id, turn_start)` before either failure return) — this flag is the
+  one behavioral difference the contract draws between the two calls'
+  failure paths, so it's threaded through explicitly rather than inferred.
 
 ## bot.py
 
@@ -535,6 +547,21 @@ then `await lock.acquire()` / `try` / `finally: lock.release()`):
   check for all five command handlers; sends `please_wait` and returns
   `True` if contended (caller returns immediately), else returns `False`
   without touching the lock (the caller acquires it right after).
+- `_command_guard(update, context) -> bool` (async) — added during a
+  post-implementation cleanup pass (2026-06-24): combines `_reject_if_group`
+  + `_send_or_wait` into the one preamble line every command handler needs
+  (`if await _command_guard(update, context): return`). `message_handler`
+  does **not** use this — its lock-contention behavior (discard silently,
+  no `please_wait`) and `turn_start` capture point differ, so it keeps its
+  own explicit group-check + `lock.locked()` check.
+- `_locked(context)` (async context manager, via `@asynccontextmanager`) —
+  added in the same cleanup pass to replace the repeated `await
+  lock.acquire(); try: ...; finally: lock.release()` block in
+  `message_handler` and all five command handlers with `async with
+  _locked(context): ...`. Behaviorally identical (same lock object via
+  `_get_lock`, same acquire-then-release-in-finally semantics) — purely a
+  duplication removal, verified by the full `tests/test_bot.py` suite
+  passing unchanged.
 - `_split_into_chunks(text: str, limit: int = 4096) -> list[str]` — pure,
   synchronous. Greedily finds the rightmost `\n\n` at or before `limit` in
   the remaining text; if none, the rightmost single `\n`; if neither, hard
@@ -554,8 +581,14 @@ then `await lock.acquire()` / `try` / `finally: lock.release()`):
   `logger.log_stdout("ERROR", "send_error", None, {"chat_id": chat_id})`
   and returns — never raises.
 - `_keep_typing(telegram_bot, chat_id: int) -> None` (async) — infinite loop:
-  `send_chat_action(TYPING)` then `asyncio.sleep(4)`; re-raises
-  `asyncio.CancelledError` (so the awaiting `_cancel_keep_typing` sees it).
+  `send_chat_action(TYPING)` then `asyncio.sleep(4)`. No internal
+  `try`/`except` for `asyncio.CancelledError` — cancellation during either
+  `await` naturally propagates out and marks the task cancelled, which is
+  exactly what `_cancel_keep_typing`'s `await task` is waiting to observe;
+  an earlier version caught-and-re-raised `CancelledError` here, which was
+  a no-op removed in a 2026-06-24 cleanup pass (behaviorally identical,
+  confirmed by `tests/test_bot.py::test_keep_typing_sends_typing_action_until_cancelled`
+  still passing unchanged).
 - `_cancel_keep_typing(task: asyncio.Task | None) -> None` (async) —
   no-op if `task` is `None`; otherwise `task.cancel()` then `await task`
   inside a `try`/`except asyncio.CancelledError: pass`, so callers never
@@ -627,7 +660,12 @@ file itself imported (there's only one `asyncio` module per process), so a
 test's own `await asyncio.sleep(...)` calls get redirected too; prefer
 patching a small `_KEEP_TYPING_INTERVAL_SECONDS`-style module constant
 instead of `asyncio.sleep` itself when the test also needs real scheduling
-yields (as `_keep_typing`'s test does).
+yields (as `_keep_typing`'s test does). `_patch_token_validation(bot_module,
+monkeypatch, status_code=200, get_side_effect=None) -> AsyncMock` (added in
+a 2026-06-24 cleanup pass) replaces the 5-line `httpx.AsyncClient` mocking
+block that was previously duplicated across ~12 token-input tests; returns
+the mock client instance so a test can still reconfigure `client_instance
+.get` mid-test for sequence tests (e.g. invalid token, then retry valid).
 
 ## scripts/rotate_key.py
 

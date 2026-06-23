@@ -122,6 +122,52 @@ async def _handle_rate_limit(user_id: int, response: httpx.Response, language: s
     return messages.get(key, language, retry_time=retry_human)
 
 
+async def _run_llm_call(
+    stage: str,
+    messages_payload: list[dict],
+    tools: list,
+    user_id: int,
+    language: str,
+    turn_start: datetime,
+    cleanup_on_failure: bool,
+) -> tuple[dict | None, str | None]:
+    """Makes one LLM call and handles its timeout/429/logging boilerplate.
+
+    Returns `(message, None)` on success or `(None, early_return_answer)` on
+    timeout or rate limit. `cleanup_on_failure` controls whether
+    `delete_turn_tool_results(user_id, turn_start)` runs before an early
+    return — `True` for the second call (tool results already persisted),
+    `False` for the first (nothing to clean up yet).
+    """
+    try:
+        response, latency_ms = await _call_llm(messages_payload, tools)
+    except httpx.TimeoutException:
+        if cleanup_on_failure:
+            await db.delete_turn_tool_results(user_id, turn_start)
+        await db.log(user_id, "WARNING", "llm_call", {"stage": stage, "error": "timeout"})
+        return None, messages.get("llm_timeout", language)
+
+    if response.status_code == 429:
+        if cleanup_on_failure:
+            await db.delete_turn_tool_results(user_id, turn_start)
+        return None, await _handle_rate_limit(user_id, response, language)
+
+    response.raise_for_status()
+    payload = response.json()
+    message = payload["choices"][0]["message"]
+    await db.log(
+        user_id,
+        "INFO",
+        "llm_call",
+        {
+            "stage": stage,
+            "latency_ms": latency_ms,
+            "token_count": _extract_token_count(payload),
+        },
+    )
+    return message, None
+
+
 async def process_message(
     user_id: int,
     user_text: str,
@@ -138,33 +184,17 @@ async def process_message(
     conversation = list(history) + [user_msg]
     tools = await mcp.get_tools(token)
 
-    try:
-        response, latency_ms = await _call_llm([system_message] + conversation, tools)
-    except httpx.TimeoutException:
-        await db.log(
-            user_id,
-            "WARNING",
-            "llm_call",
-            {"stage": "tool_selection", "error": "timeout"},
-        )
-        return messages.get("llm_timeout", language)
-
-    if response.status_code == 429:
-        return await _handle_rate_limit(user_id, response, language)
-
-    response.raise_for_status()
-    payload = response.json()
-    message = payload["choices"][0]["message"]
-    await db.log(
+    message, early_return = await _run_llm_call(
+        "tool_selection",
+        [system_message] + conversation,
+        tools,
         user_id,
-        "INFO",
-        "llm_call",
-        {
-            "stage": "tool_selection",
-            "latency_ms": latency_ms,
-            "token_count": _extract_token_count(payload),
-        },
+        language,
+        turn_start,
+        cleanup_on_failure=False,
     )
+    if early_return is not None:
+        return early_return
 
     content = message.get("content")
     tool_calls = message.get("tool_calls")
@@ -221,35 +251,17 @@ async def process_message(
             {"tool": name, "params": arguments, "latency_ms": tool_latency_ms},
         )
 
-    try:
-        response2, latency_ms2 = await _call_llm([system_message] + conversation, tools)
-    except httpx.TimeoutException:
-        await db.delete_turn_tool_results(user_id, turn_start)
-        await db.log(
-            user_id,
-            "WARNING",
-            "llm_call",
-            {"stage": "answer_generation", "error": "timeout"},
-        )
-        return messages.get("llm_timeout", language)
-
-    if response2.status_code == 429:
-        await db.delete_turn_tool_results(user_id, turn_start)
-        return await _handle_rate_limit(user_id, response2, language)
-
-    response2.raise_for_status()
-    payload2 = response2.json()
-    message2 = payload2["choices"][0]["message"]
-    await db.log(
+    message2, early_return2 = await _run_llm_call(
+        "answer_generation",
+        [system_message] + conversation,
+        tools,
         user_id,
-        "INFO",
-        "llm_call",
-        {
-            "stage": "answer_generation",
-            "latency_ms": latency_ms2,
-            "token_count": _extract_token_count(payload2),
-        },
+        language,
+        turn_start,
+        cleanup_on_failure=True,
     )
+    if early_return2 is not None:
+        return early_return2
 
     answer = _strip_thinking(message2.get("content"))
     await db.save_turn(user_id, {"role": "assistant", "content": answer})

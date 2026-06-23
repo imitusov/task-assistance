@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -89,12 +90,9 @@ async def _send_with_truncation(telegram_bot, chat_id: int, text: str, lang: str
 
 
 async def _keep_typing(telegram_bot, chat_id: int) -> None:
-    try:
-        while True:
-            await telegram_bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            await asyncio.sleep(_KEEP_TYPING_INTERVAL_SECONDS)
-    except asyncio.CancelledError:
-        raise
+    while True:
+        await telegram_bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        await asyncio.sleep(_KEEP_TYPING_INTERVAL_SECONDS)
 
 
 async def _cancel_keep_typing(task: asyncio.Task | None) -> None:
@@ -111,16 +109,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await _reject_if_group(update, context):
         return
 
-    lock = _get_lock(context)
-    if lock.locked():
+    if _get_lock(context).locked():
         return
 
-    await lock.acquire()
-    turn_start = datetime.now(timezone.utc)
-    try:
+    async with _locked(context):
+        turn_start = datetime.now(timezone.utc)
         await _process_message(update, context, turn_start)
-    finally:
-        lock.release()
 
 
 async def _process_message(
@@ -254,15 +248,28 @@ async def _send_or_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     return False
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if the caller should stop (group rejection or lock contention)."""
     if await _reject_if_group(update, context):
-        return
-    if await _send_or_wait(update, context):
-        return
+        return True
+    return await _send_or_wait(update, context)
 
+
+@asynccontextmanager
+async def _locked(context: ContextTypes.DEFAULT_TYPE):
     lock = _get_lock(context)
     await lock.acquire()
     try:
+        yield
+    finally:
+        lock.release()
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _command_guard(update, context):
+        return
+
+    async with _locked(context):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         text = update.message.text or ""
@@ -277,38 +284,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             await context.bot.send_message(chat_id=chat_id, text=messages.get("welcome", detected_lang))
             context.user_data["state"] = STATE_AWAITING_TOKEN
-    finally:
-        lock.release()
 
 
 async def token_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_group(update, context):
-        return
-    if await _send_or_wait(update, context):
+    if await _command_guard(update, context):
         return
 
-    lock = _get_lock(context)
-    await lock.acquire()
-    try:
+    async with _locked(context):
         chat_id = update.effective_chat.id
         text = update.message.text or ""
         detected_lang = language.detect(text)
         context.user_data["detected_language"] = detected_lang
         await context.bot.send_message(chat_id=chat_id, text=messages.get("welcome", detected_lang))
         context.user_data["state"] = STATE_AWAITING_TOKEN
-    finally:
-        lock.release()
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_group(update, context):
-        return
-    if await _send_or_wait(update, context):
+    if await _command_guard(update, context):
         return
 
-    lock = _get_lock(context)
-    await lock.acquire()
-    try:
+    async with _locked(context):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         text = update.message.text or ""
@@ -322,19 +317,13 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         await context.bot.send_message(chat_id=chat_id, text=messages.get("reset_prompt", user["language"]))
         context.user_data["state"] = STATE_AWAITING_RESET
-    finally:
-        lock.release()
 
 
 async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_group(update, context):
-        return
-    if await _send_or_wait(update, context):
+    if await _command_guard(update, context):
         return
 
-    lock = _get_lock(context)
-    await lock.acquire()
-    try:
+    async with _locked(context):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         text = update.message.text or ""
@@ -351,19 +340,13 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(
             chat_id=chat_id, text=messages.get("refresh_confirmed", user["language"])
         )
-    finally:
-        lock.release()
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _reject_if_group(update, context):
-        return
-    if await _send_or_wait(update, context):
+    if await _command_guard(update, context):
         return
 
-    lock = _get_lock(context)
-    await lock.acquire()
-    try:
+    async with _locked(context):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         text = update.message.text or ""
@@ -371,8 +354,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user = await db.get_user(user_id)
         lang = user["language"] if user is not None else language.detect(text)
         await context.bot.send_message(chat_id=chat_id, text=messages.get("help_text", lang))
-    finally:
-        lock.release()
 
 
 async def _heartbeat(start_time: float) -> None:

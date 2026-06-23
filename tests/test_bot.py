@@ -78,6 +78,21 @@ def _make_user(bot_module, language="en", plain_token="x" * 40):
     }
 
 
+def _patch_token_validation(bot_module, monkeypatch, status_code=200, get_side_effect=None):
+    """Mocks the httpx.AsyncClient used by _handle_token_input's GET to the
+    Todoist projects endpoint. Pass get_side_effect for network-error cases."""
+    client_instance = AsyncMock()
+    if get_side_effect is not None:
+        client_instance.get = AsyncMock(side_effect=get_side_effect)
+    else:
+        response = httpx.Response(status_code, request=httpx.Request("GET", "https://x"))
+        client_instance.get = AsyncMock(return_value=response)
+    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
+    client_instance.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(bot_module.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    return client_instance
+
+
 # --- Group chat guard --------------------------------------------------------
 
 
@@ -212,12 +227,7 @@ async def test_normal_state_runs_message_handler_path(bot):
 async def test_awaiting_token_state_routes_to_token_handler(bot, monkeypatch):
     update = _make_update(text="a" * 40)
     context = _make_context(user_data={"state": "AWAITING_TOKEN"})
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     await bot.message_handler(update, context)
 
@@ -319,12 +329,7 @@ async def test_sequence_start_then_valid_token(bot, monkeypatch):
     await bot.start_command(update_start, context)
     assert context.user_data["state"] == "AWAITING_TOKEN"
 
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     update_token = _make_update(text="a" * 40)
     await bot.message_handler(update_token, context)
@@ -341,12 +346,7 @@ async def test_sequence_start_invalid_then_valid_token(bot, monkeypatch):
     bot.db.get_user = AsyncMock(return_value=None)
     await bot.start_command(update_start, context)
 
-    bad_response = httpx.Response(401, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=bad_response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    client_instance = _patch_token_validation(bot, monkeypatch, status_code=401)
 
     update_token = _make_update(text="a" * 40)
     await bot.message_handler(update_token, context)
@@ -402,11 +402,9 @@ async def test_sequence_token_network_error_then_valid(bot, monkeypatch):
     context = _make_context()
     await bot.token_command(update_token_cmd, context)
 
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(side_effect=httpx.ConnectError("down"))
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    client_instance = _patch_token_validation(
+        bot, monkeypatch, get_side_effect=httpx.ConnectError("down")
+    )
 
     update_token = _make_update(text="a" * 40)
     await bot.message_handler(update_token, context)
@@ -589,12 +587,7 @@ async def test_token_input_valid_deletes_message_saves_user_sends_accepted(
 ):
     update = _make_update(text="a" * 40)
     context = _make_context(user_data={"state": "AWAITING_TOKEN"})
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     await bot.message_handler(update, context)
 
@@ -608,12 +601,7 @@ async def test_token_input_valid_deletes_message_saves_user_sends_accepted(
 async def test_token_input_non_200_sends_token_invalid_stays_awaiting(bot, monkeypatch):
     update = _make_update(text="a" * 40)
     context = _make_context(user_data={"state": "AWAITING_TOKEN"})
-    response = httpx.Response(403, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch, status_code=403)
 
     await bot.message_handler(update, context)
 
@@ -627,11 +615,9 @@ async def test_token_input_non_200_sends_token_invalid_stays_awaiting(bot, monke
 async def test_token_input_network_error_sends_token_network_error(bot, monkeypatch):
     update = _make_update(text="a" * 40)
     context = _make_context(user_data={"state": "AWAITING_TOKEN"})
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(side_effect=httpx.ConnectTimeout("timeout"))
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(
+        bot, monkeypatch, get_side_effect=httpx.ConnectTimeout("timeout")
+    )
 
     await bot.message_handler(update, context)
 
@@ -645,12 +631,7 @@ async def test_token_input_deletion_failure_continues(bot, monkeypatch):
     update = _make_update(text="a" * 40)
     update.message.delete = AsyncMock(side_effect=RuntimeError("can't delete"))
     context = _make_context(user_data={"state": "AWAITING_TOKEN"})
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     await bot.message_handler(update, context)
 
@@ -666,12 +647,7 @@ async def test_token_input_existing_user_evicts_old_token_cache(bot, monkeypatch
     bot.db.get_user = AsyncMock(return_value=_make_user(bot, plain_token="y" * 40))
     monkeypatch.setattr(bot.crypto, "decrypt_token", MagicMock(return_value="OLD_PLAIN"))
     monkeypatch.setattr(bot.crypto, "encrypt_token", MagicMock(return_value="new-encrypted"))
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     await bot.message_handler(update, context)
 
@@ -683,12 +659,7 @@ async def test_token_input_uses_detected_language_not_token_string(bot, monkeypa
     context = _make_context(
         user_data={"state": "AWAITING_TOKEN", "detected_language": "ru"}
     )
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     await bot.message_handler(update, context)
 
@@ -702,12 +673,7 @@ async def test_token_input_detected_language_cleared_on_success(bot, monkeypatch
     context = _make_context(
         user_data={"state": "AWAITING_TOKEN", "detected_language": "ru"}
     )
-    response = httpx.Response(200, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch)
 
     await bot.message_handler(update, context)
 
@@ -719,12 +685,7 @@ async def test_token_input_detected_language_preserved_on_invalid(bot, monkeypat
     context = _make_context(
         user_data={"state": "AWAITING_TOKEN", "detected_language": "ru"}
     )
-    response = httpx.Response(401, request=httpx.Request("GET", "https://x"))
-    client_instance = AsyncMock()
-    client_instance.get = AsyncMock(return_value=response)
-    client_instance.__aenter__ = AsyncMock(return_value=client_instance)
-    client_instance.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(bot.httpx, "AsyncClient", MagicMock(return_value=client_instance))
+    _patch_token_validation(bot, monkeypatch, status_code=401)
 
     await bot.message_handler(update, context)
 
