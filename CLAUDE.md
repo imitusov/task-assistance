@@ -52,6 +52,13 @@ Implement exactly ONE module per task — never two.
 - Cancel the keep-typing task in `finally` (bot handlers)
 - Wrap external calls (LLM, MCP, DB, Telegram) per the error rules
 
+## Environment — always use `.venv`
+
+A virtual environment already exists at `.venv` in the project root. Activate it
+once per session (`source .venv/bin/activate`) before any `python`, `pip`, or
+`pytest` command. Never create a new venv and never install into system Python.
+A `ModuleNotFoundError` means the venv is not active — activate it, don't pip-install.
+
 ## Coding conventions
 
 - Language: Python 3.11+
