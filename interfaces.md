@@ -278,3 +278,62 @@ rolled back in teardown; `db._pool` is monkeypatched to a tiny
 `_SingleConnPool` wrapper whose `acquire()` yields that same connection
 (no real pool, no release/commit) so all queries in a test stay inside the
 one rolled-back transaction.
+
+## mcp.py
+
+Client for the official Todoist MCP server (`https://ai.todoist.net/mcp`,
+module constant `MCP_ENDPOINT`). Depends only on `config` (`MCP_TOOLS_TTL`,
+read fresh on every `get_tools` call, not cached at import) — does **not**
+import `db.py` or `logger.py` (the contract listed `logger` as available
+but the module ended up not needing it: no failure path here is swallowed
+or logged internally — every failure is a raised exception for the caller,
+typically `llm.py`, to log and translate into a user-facing message per
+Rule 1/Rule 6). Pure in-process, per-token cache — no module-level side
+effects beyond the `_cache` dict and `_TIMEOUT` constant.
+
+**Public**
+- `get_tools(token: str) -> list` (async) — OpenAI-format tool list
+  (`[{"type": "function", "function": {...}}, ...]`), cached per `token` in
+  module-level `_cache: dict[str, tuple[list, float]]` keyed by raw token
+  string. Cache hit requires `time.time() - fetched_at < config.MCP_TOOLS_TTL`;
+  otherwise re-fetches via JSON-RPC `tools/list`, converts every tool, caches
+  the **converted** list (never raw MCP shape), and returns it.
+- `call_tool(token: str, name: str, arguments: dict) -> dict` (async) —
+  JSON-RPC `tools/call` with `params={"name": name, "arguments": arguments}`;
+  returns the `result` field of the parsed response (a `dict`, e.g.
+  `{"content": [...], "isError": false}` per the MCP tool-call result
+  shape). Raises (never swallows) on HTTP error status
+  (`response.raise_for_status()`), SSE parse failure, a JSON-RPC `error`
+  field in the response (`RuntimeError`), or `httpx` timeout.
+- `evict_cache(token: str) -> None` — `_cache.pop(token, None)`; silent
+  no-op if the token was never cached.
+
+**Private helpers** (not part of the module's public contract surface, but
+directly unit-tested since there's no public wrapper purely for them):
+- `_parse_sse(text: str) -> dict` — scans lines (each stripped) for the
+  first one starting with `"data:"`, strips the prefix and surrounding
+  whitespace, `json.loads`s it. Raises `ValueError` containing the raw
+  `text` verbatim (not `repr`'d) if no `data:` line exists.
+- `_convert_tool(tool: dict) -> dict` — copies every key except
+  `inputSchema` into `function`, adds `function["parameters"] =
+  tool.get("inputSchema", {})`, wraps as `{"type": "function", "function":
+  function}`. Empty `inputSchema` → empty `parameters`. All non-schema
+  fields (`name`, `description`, anything else MCP sends) pass through
+  unchanged.
+- `_call_rpc(token, method, params=None) -> dict` — shared JSON-RPC/SSE
+  request plumbing for both public functions; builds the
+  `{"jsonrpc": "2.0", "id": 1, "method": ..., "params": ...}` envelope,
+  POSTs to `MCP_ENDPOINT` with `Authorization: Bearer <token>`,
+  `Content-Type: application/json`, `Accept: application/json,
+  text/event-stream`, under `httpx.AsyncClient(timeout=_TIMEOUT)`.
+- `_headers(token: str) -> dict` — the three headers above.
+
+**Deviation from literal contract (flagged, no blocking ambiguity —
+same documented-deviation precedent as [[language.py]] and the
+`delete_turn_tool_results` note in [[db.py]]):** the contract specifies
+`httpx.Timeout(total=10.0)`. The installed `httpx` (0.28.1) does not accept
+a `total` keyword on `Timeout` (`TypeError: unexpected keyword argument
+'total'` — verified empirically). `_TIMEOUT = httpx.Timeout(10.0)`
+(positional) is used instead, which sets connect/read/write/pool all to
+10 seconds — the same intent ("10s total for full SSE receipt") expressed
+in the form this `httpx` version actually supports.
