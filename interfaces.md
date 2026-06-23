@@ -122,3 +122,31 @@ threshold (`_CONFIDENCE_GATE = 0.6`, private) instead of the public
 `MIN_DETECTION_CONFIDENCE` constant. `MIN_DETECTION_CONFIDENCE` remains
 defined at `0.9` to satisfy the contract's constant requirement but is not
 used as the actual gate value in `detect()`.
+
+## logger.py
+
+Depends on `config` (reads `config.LOG_LEVEL`). No other internal
+dependencies.
+
+**sanitize(data: dict) → dict**
+- Scans top-level keys only — does NOT recurse into nested dicts or lists
+  (explicit design rule, not a limitation)
+- Case-insensitive substring match on each key: keys containing `token`,
+  `api_key`, `secret`, or `password` → value replaced with
+  `"***REDACTED***"`
+- Returns a new dict; never mutates the input
+- Nested dict/list values are passed through unchanged regardless of their
+  contents, even if a nested key would otherwise match
+
+**log_stdout(level: str, event: str, user_id: int | None, data: dict) → None**
+- Writes a single JSON line to stdout via `print`
+- Fields: `timestamp` (ISO 8601, timezone-aware UTC via
+  `datetime.now(timezone.utc).isoformat()`), `level`, `event`, `user_id`,
+  `data` (run through `sanitize` first)
+- `user_id` may be `None`
+- Respects `config.LOG_LEVEL`: levels are ranked via
+  `logging.getLevelNamesMapping()` (standard `DEBUG`/`INFO`/`WARNING`/
+  `ERROR`/`CRITICAL` ranks); if `level`'s rank is below
+  `config.LOG_LEVEL`'s rank, nothing is printed
+- Never raises on its own — callers per the spec's Error Handling Rule 2
+  (DB log failures → `log_stdout` only) rely on this being a safe fallback
