@@ -5,7 +5,7 @@ import httpx
 
 import config
 
-MCP_ENDPOINT = "https://ai.todoist.net/mcp"
+MCP_ENDPOINT = config.MCP_SERVER_URL
 
 _TIMEOUT = httpx.Timeout(10.0)
 

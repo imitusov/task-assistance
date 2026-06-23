@@ -813,6 +813,21 @@ new key, `update_token` for each. On batch failure: rollback batch, log
 failed `user_id` with traceback, continue to next batch. Print per-batch
 progress and final summary (succeeded / failed). Does not delete old key.
 
+**Implementation deviations (maintainer-confirmed 2026-06-24):**
+- **Keys come from the CLI, not `crypto.py`.** `crypto.encrypt_token` /
+  `decrypt_token` are hardwired to `config.SECRET_KEY` and cannot take a key
+  argument, so the script uses `cryptography.fernet.Fernet(old_key)` /
+  `Fernet(new_key)` directly. This is the one sanctioned place that bypasses
+  `crypto.py`.
+- **No atomic per-batch transaction.** `db.update_token` acquires its own
+  connection per call and exposes no shared-transaction handle, and extending
+  `db.py` is out of scope for this utility. Therefore "single DB transaction
+  per batch / rollback batch" is NOT implemented: a batch is a progress and
+  error-isolation grouping only, each `update_token` commits on its own, and a
+  failing row is logged-and-skipped (not rolled back). Acceptable for a manual
+  v1 utility run during downtime; re-encryption is idempotent, so a re-run
+  safely retries any rows missed by a prior failure.
+
 ---
 
 ## Database Schema

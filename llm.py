@@ -9,7 +9,7 @@ import db
 import mcp
 import messages
 
-_MODEL = "Qwen3.6-35b-a3b"
+_MODEL = config.LLM_MODEL
 _LLM_TIMEOUT = httpx.Timeout(30.0)
 
 _THINK_OPEN = "<think>"

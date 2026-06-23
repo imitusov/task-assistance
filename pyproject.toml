@@ -1,3 +1,12 @@
 [tool.pytest.ini_options]
 addopts = "--cov=. --cov-fail-under=80"
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+# Standalone manual pre-development probe scripts — run by hand against the real
+# APIs, not unit-tested, and not part of the deployed bot. Excluded so they
+# don't dilute the coverage percentage of the actual application modules.
+omit = [
+    "test_qwen_tools.py",
+    "test_mcp_auth.py",
+]
