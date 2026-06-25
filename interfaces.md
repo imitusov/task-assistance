@@ -435,15 +435,20 @@ unit-tested directly):
   this exact format is this implementation's own choice.
 - `_extract_token_count(payload: dict) -> int | None` — `payload["usage"]
   ["total_tokens"]` if `usage` is present and truthy, else `None`.
-- `_call_llm(messages_payload: list[dict], tools: list) -> tuple[httpx.Response, float]`
+- `_call_llm(messages_payload: list[dict], tools: list, user_id: int) -> tuple[httpx.Response, float]`
   (async) — POSTs to `f"{config.NEURALDEEP_API_URL}/chat/completions"`
   with `{"model": _MODEL, "messages": ..., "tools": ..., "tool_choice":
-  "auto"}` under `httpx.AsyncClient(timeout=_LLM_TIMEOUT)` (30s, plain
+  "auto", "user": str(user_id)}` under `httpx.AsyncClient(timeout=_LLM_TIMEOUT)`
+  (30s, plain
   `httpx.Timeout(30.0)` positional form — see the [[mcp.py]] deviation
   note on why `total=` isn't used here either). Returns the raw
   `httpx.Response` (not pre-parsed JSON) plus latency in milliseconds, so
   the caller can branch on `status_code == 429` before ever calling
-  `.json()`. Module constant `_MODEL = config.LLM_MODEL`
+  `.json()`. The `"user": str(user_id)` field is a NeuralDeep performance
+  hint, not abuse-tracking: a stable per-user id makes the balancer route the
+  user to the same upstream, keeping the prompt KV-cache warm across turns
+  (faster multi-turn). `user_id` is threaded from `process_message` →
+  `_run_llm_call` → `_call_llm`. Module constant `_MODEL = config.LLM_MODEL`
   (default `"qwen3.6-35b-a3b"`, read once at import). Note: the name is
   lowercase — the capitalised `Qwen3.6-35b-a3b` from the brief's Tech Stack
   table is rejected by NeuralDeep keys with HTTP 401 (verified via

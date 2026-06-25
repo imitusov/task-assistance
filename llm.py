@@ -85,12 +85,15 @@ def _extract_token_count(payload: dict) -> int | None:
     return usage.get("total_tokens")
 
 
-async def _call_llm(messages_payload: list[dict], tools: list):
+async def _call_llm(messages_payload: list[dict], tools: list, user_id: int):
     payload = {
         "model": _MODEL,
         "messages": messages_payload,
         "tools": tools,
         "tool_choice": "auto",
+        # Stable per-user id → NeuralDeep routes the user to the same upstream,
+        # keeping the prompt KV-cache warm across turns (faster multi-turn).
+        "user": str(user_id),
     }
     headers = {
         "Authorization": f"Bearer {config.NEURALDEEP_API_KEY}",
@@ -140,7 +143,7 @@ async def _run_llm_call(
     `False` for the first (nothing to clean up yet).
     """
     try:
-        response, latency_ms = await _call_llm(messages_payload, tools)
+        response, latency_ms = await _call_llm(messages_payload, tools, user_id)
     except httpx.TimeoutException:
         if cleanup_on_failure:
             await db.delete_turn_tool_results(user_id, turn_start)

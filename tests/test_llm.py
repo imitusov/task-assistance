@@ -117,6 +117,22 @@ async def test_direct_answer_returns_llm_content(llm, monkeypatch):
     assert answer == "Here are your tasks."
 
 
+async def test_llm_call_includes_user_id_for_upstream_affinity(llm, monkeypatch):
+    # `user: <id>` keeps the user on one upstream so the KV-cache stays warm.
+    first = _llm_response(_message_payload(content=None, tool_calls=[_tool_call(
+        "call-1", "find-tasks", {})]))
+    second = _llm_response(_message_payload(content="Done."))
+    _, client_instance = _patch_llm_client(llm, monkeypatch, [first, second])
+
+    await llm.process_message(42, "what's due today?", "tok", "en", TURN_START)
+
+    # Sent as a string on every LLM call in the turn (both the tool-selection
+    # call and the answer-generation call).
+    assert client_instance.post.call_count == 2
+    for call in client_instance.post.call_args_list:
+        assert call.kwargs["json"]["user"] == "42"
+
+
 # --- Tool calling path ---------------------------------------------------
 
 
