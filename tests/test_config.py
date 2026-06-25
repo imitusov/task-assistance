@@ -14,6 +14,10 @@ REQUIRED_VARS = {
 
 
 def _reload_config(monkeypatch, env, clear_required=None):
+    # Neutralize .env autoloading so these tests depend ONLY on the env vars
+    # set here — never on a developer's local .env file. Patched before the
+    # reimport so config's `from dotenv import load_dotenv` picks up the no-op.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     if clear_required:

@@ -1,5 +1,13 @@
 import os
 
+from dotenv import load_dotenv
+
+# Load a local .env if present. override=False so already-set environment
+# variables (Railway's injected vars in prod, the test suite's monkeypatched
+# vars in CI/tests) always win over the file — and it's a silent no-op when no
+# .env exists (e.g. on Railway).
+load_dotenv(override=False)
+
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 NEURALDEEP_API_KEY = os.environ["NEURALDEEP_API_KEY"]
 NEURALDEEP_API_URL = os.environ["NEURALDEEP_API_URL"]

@@ -12,8 +12,13 @@ code.
 ## config.py
 
 Loads all env vars at import time (module-level side effect, per CLAUDE.md
-exception). Required vars raise `KeyError` at import if missing — never
-silently defaulted.
+exception). Calls `dotenv.load_dotenv(override=False)` first, so a local `.env`
+is auto-loaded without manual sourcing, while already-set vars (Railway's
+injected vars, the test suite's monkeypatched vars) take precedence and a
+missing `.env` is a silent no-op. Required vars raise `KeyError` at import if
+missing — never silently defaulted. (Tests that reload `config` neutralize the
+loader via `monkeypatch.setattr("dotenv.load_dotenv", ...)` so they depend only
+on explicitly-set vars, never a developer's local `.env`.)
 
 **Required (str, no default — `KeyError` if unset):**
 - `TELEGRAM_BOT_TOKEN: str`

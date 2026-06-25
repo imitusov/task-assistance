@@ -51,7 +51,10 @@ Second LLM call to formulate the answer  →  reply in the user's language
 ## Configuration
 
 All configuration is read through `config.py` — never `os.environ` directly.
-Copy `.env.example` to `.env` and fill it in.
+Copy `.env.example` to `.env` and fill it in. `config.py` auto-loads `.env` at
+import (via `python-dotenv`), so `python bot.py`, `pytest`, and `alembic` pick
+it up with no manual sourcing. Already-set environment variables win over the
+file, so on Railway (where vars are injected and no `.env` exists) it's a no-op.
 
 **Required:**
 

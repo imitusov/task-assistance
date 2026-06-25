@@ -958,6 +958,7 @@ cryptography>=42.0.0        — Fernet encryption
 alembic>=1.13.0             — migrations
 sqlalchemy>=2.0.0           — required by Alembic
 langdetect                  — offline EN/RU detection
+python-dotenv               — load .env at import in config (no-op in prod)
 pytest                      — test runner
 pytest-asyncio              — async test support
 pytest-cov                  — coverage reporting (min 80%, bot.py 70%)
