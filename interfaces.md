@@ -34,6 +34,11 @@ silently defaulted.
   reject the capitalised `Qwen3.6-35b-a3b` with HTTP 401; consumed by `llm.py`)
 - `MCP_SERVER_URL: str` — default `"https://ai.todoist.net/mcp"` (consumed by
   `mcp.py` as `MCP_ENDPOINT`)
+- `TODOIST_BASE_URL: str` — default `"https://api.todoist.com/api/v1"` (Todoist
+  REST base for token validation; `bot.py` builds `{base}/projects` from it.
+  The legacy `api.todoist.net/rest/v2` host is dead/sunset — verified
+  2026-06-24: `.net` does not resolve, `rest/v2` returns HTTP 410, the unified
+  `api.todoist.com/api/v1/projects` returns 401 unauthenticated)
 
 All modules must import these names from `config` — never read
 `os.environ` directly.
@@ -531,8 +536,10 @@ then `await lock.acquire()` / `try` / `finally: lock.release()`):
   `"en"` branch — `language.detect` already defaults there on its own).
   Deletes the token message first (failure → sends
   `token_deletion_failed` but **continues**, does not return). Validates
-  via `GET https://api.todoist.net/rest/v2/projects` with
-  `Authorization: Bearer <plain_token>` (10s timeout): network exception
+  via `GET {config.TODOIST_BASE_URL}/projects` (default
+  `https://api.todoist.com/api/v1/projects`; module constant
+  `_TODOIST_PROJECTS_URL`) with `Authorization: Bearer <plain_token>`
+  (10s timeout): network exception
   (`httpx.HTTPError`) → `token_network_error`, state untouched (stays
   `AWAITING_TOKEN`); non-200 → `token_invalid`, state untouched. On success:
   loads the existing user (if any) and evicts its **old** plaintext token

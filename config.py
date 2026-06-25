@@ -14,3 +14,4 @@ LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", 30))
 
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.6-35b-a3b")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "https://ai.todoist.net/mcp")
+TODOIST_BASE_URL = os.environ.get("TODOIST_BASE_URL", "https://api.todoist.com/api/v1")

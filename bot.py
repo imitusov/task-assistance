@@ -24,7 +24,7 @@ STATE_AWAITING_RESET = "AWAITING_RESET"
 
 _MAX_MESSAGE_LENGTH = 4096
 _TOKEN_PATTERN = re.compile(r"^[a-zA-Z0-9]{40}$")
-_TODOIST_PROJECTS_URL = "https://api.todoist.net/rest/v2/projects"
+_TODOIST_PROJECTS_URL = f"{config.TODOIST_BASE_URL.rstrip('/')}/projects"
 
 _HEARTBEAT_INTERVAL_SECONDS = 60
 _CLEANUP_HOUR_UTC = 3
