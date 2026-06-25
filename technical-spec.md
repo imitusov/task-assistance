@@ -498,6 +498,17 @@ passing to `log`. Case-insensitive key scan. Keys containing `token`,
 does not mutate input. Values that are themselves dicts or lists are passed
 through unchanged regardless of their contents.
 
+**Deviation (maintainer-confirmed 2026-06-25):** the literal substring rule
+above self-conflicts with this spec's own `llm_call` field name
+`token_count` (see Log Events table and the Grafana query
+`data->>'token_count' ... ::int`) — `token_count` contains `"token"`, so a
+literal implementation redacts it to the string `"***REDACTED***"`,
+corrupting the metric and breaking the documented Grafana cast. Found in
+production: real `llm_call` logs showed `"token_count": "***REDACTED***"`.
+Resolution: `sanitize` carries a narrow, explicit exception for the exact key
+`token_count` (not a general allowlist) so it passes through unredacted
+while every other token/secret-shaped key is still caught.
+
 **log_stdout(level, event, user_id, data)**
 Single JSON line to stdout. Fields: `timestamp` (ISO 8601 UTC), `level`,
 `event`, `user_id`, `data`. Calls `sanitize` on `data`. `user_id` may be

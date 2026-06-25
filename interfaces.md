@@ -127,6 +127,17 @@ dependencies.
 - Case-insensitive substring match on each key: keys containing `token`,
   `api_key`, `secret`, or `password` → value replaced with
   `"***REDACTED***"`
+- **Exception (bug found in production, fixed 2026-06-25):** the literal key
+  `token_count` is exempt from the substring match via a private
+  `_SAFE_KEYS = {"token_count"}` set, checked before the marker scan.
+  `token_count` contains `"token"` but is `llm.py`'s non-secret numeric
+  metric (mandated by the spec's Log Events table); without the exception it
+  was redacted to the string `"***REDACTED***"`, corrupting the value and
+  breaking the spec's documented Grafana query
+  (`data->>'token_count' ... ::int`). This is a narrow, named exception —
+  not a general allowlist — so every other token/secret-shaped key (e.g.
+  `todoist_token`, `old_key`) is still redacted, including alongside
+  `token_count` in the same dict.
 - Returns a new dict; never mutates the input
 - Nested dict/list values are passed through unchanged regardless of their
   contents, even if a nested key would otherwise match

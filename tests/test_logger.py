@@ -57,6 +57,21 @@ def test_sanitize_does_not_recurse_into_nested_dicts(logger):
     assert result == {"params": {"token": "secret"}}
 
 
+def test_sanitize_does_not_redact_token_count(logger):
+    # token_count contains the "token" substring but is a non-secret numeric
+    # metric the spec mandates be logged verbatim (llm_call event).
+    assert logger.sanitize({"token_count": 123}) == {"token_count": 123}
+
+
+def test_sanitize_does_not_redact_token_count_when_none(logger):
+    assert logger.sanitize({"token_count": None}) == {"token_count": None}
+
+
+def test_sanitize_still_redacts_real_token_alongside_token_count(logger):
+    result = logger.sanitize({"token_count": 123, "todoist_token": "abc"})
+    assert result == {"token_count": 123, "todoist_token": "***REDACTED***"}
+
+
 def test_log_stdout_writes_single_json_line(logger, capsys):
     logger.log_stdout("INFO", "user_login", 123, {"message": "ok"})
     captured = capsys.readouterr()
