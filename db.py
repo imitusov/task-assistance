@@ -154,6 +154,17 @@ async def save_tool_result(user_id: int, tool_content: dict) -> None:
         )
 
 
+async def save_assistant_tool_call(user_id: int, content: dict) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO conversations (user_id, role, content) "
+            "VALUES ($1, $2, $3::jsonb)",
+            user_id,
+            content["role"],
+            json.dumps(content),
+        )
+
+
 async def delete_turn_tool_results(user_id: int, since: datetime) -> None:
     if since.tzinfo is None:
         raise ValueError("delete_turn_tool_results requires a timezone-aware datetime")

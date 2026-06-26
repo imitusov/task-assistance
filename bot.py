@@ -21,6 +21,7 @@ import messages
 STATE_NORMAL = "NORMAL"
 STATE_AWAITING_TOKEN = "AWAITING_TOKEN"
 STATE_AWAITING_RESET = "AWAITING_RESET"
+STATE_AWAITING_TOOL_CONFIRM = "AWAITING_TOOL_CONFIRM"
 
 _MAX_MESSAGE_LENGTH = 4096
 _TOKEN_PATTERN = re.compile(r"^[a-zA-Z0-9]{40}$")
@@ -87,6 +88,27 @@ async def _send_with_truncation(telegram_bot, chat_id: int, text: str, lang: str
                     "ERROR", "send_error", None, {"chat_id": chat_id}
                 )
             return
+
+
+async def _send_confirmation_or_answer(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    lang: str,
+    result: "str | llm.ConfirmationRequired",
+) -> None:
+    """Renders an `llm.process_message`/`llm.resume_tool_call` result: a
+    plain answer is sent as-is, a `ConfirmationRequired` instead sets
+    `STATE_AWAITING_TOOL_CONFIRM` and stores the pending call for the next
+    message (mirrors the `/reset` two-step confirm pattern)."""
+    if isinstance(result, llm.ConfirmationRequired):
+        context.user_data["state"] = STATE_AWAITING_TOOL_CONFIRM
+        context.user_data["pending_tool_confirm"] = result.context
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=messages.get("tool_confirm_prompt", lang, description=result.description),
+        )
+        return
+    await _send_with_truncation(context.bot, chat_id, result, lang)
 
 
 async def _keep_typing(telegram_bot, chat_id: int) -> None:
@@ -156,6 +178,32 @@ async def _process_message(
         await context.bot.send_message(chat_id=chat_id, text=reply)
         return
 
+    if state == STATE_AWAITING_TOOL_CONFIRM:
+        stored_lang = user["language"]
+        pending_context = context.user_data.pop("pending_tool_confirm", None)
+        context.user_data["state"] = STATE_NORMAL
+        if text.strip().lower() == "confirm" and pending_context is not None:
+            try:
+                token = crypto.decrypt_token(user["todoist_token"])
+            except ValueError:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=messages.get("decrypt_error", stored_lang)
+                )
+                return
+            keep_typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+            try:
+                result = await llm.resume_tool_call(
+                    user_id, token, stored_lang, turn_start, pending_context
+                )
+            finally:
+                await _cancel_keep_typing(keep_typing_task)
+            await _send_confirmation_or_answer(context, chat_id, stored_lang, result)
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id, text=messages.get("tool_confirm_cancelled", stored_lang)
+            )
+        return
+
     lang, changed = language.resolve(user["language"], text)
     if changed:
         await db.update_language(user_id, lang)
@@ -178,11 +226,11 @@ async def _process_message(
 
     keep_typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
     try:
-        answer = await llm.process_message(user_id, text, token, lang, turn_start)
+        result = await llm.process_message(user_id, text, token, lang, turn_start)
     finally:
         await _cancel_keep_typing(keep_typing_task)
 
-    await _send_with_truncation(context.bot, chat_id, answer, lang)
+    await _send_confirmation_or_answer(context, chat_id, lang, result)
 
 
 async def _handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

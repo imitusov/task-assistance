@@ -42,8 +42,11 @@ def bot(monkeypatch):
     module.mcp = MagicMock()
     module.mcp.evict_cache = AsyncMock()
 
+    real_llm = sys.modules["llm"]
     module.llm = MagicMock()
     module.llm.process_message = AsyncMock(return_value="answer")
+    module.llm.resume_tool_call = AsyncMock(return_value="answer")
+    module.llm.ConfirmationRequired = real_llm.ConfirmationRequired
 
     return module
 
@@ -285,6 +288,161 @@ async def test_awaiting_reset_other_text_cancelled_state_normal(bot):
     assert context.bot.send_message.call_args.kwargs["text"] == bot.messages.get(
         "reset_cancelled", "en"
     )
+
+
+# --- Destructive-action confirmation ----------------------------------------
+
+
+async def test_confirmation_required_sets_state_sends_prompt_stores_pending(bot):
+    update = _make_update(text="delete that task")
+    context = _make_context()
+    bot.db.get_user = AsyncMock(return_value=_make_user(bot))
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    bot.llm.process_message = AsyncMock(
+        return_value=bot.llm.ConfirmationRequired(
+            description="delete-object(id=123)", context=pending_context
+        )
+    )
+
+    await bot.message_handler(update, context)
+
+    assert context.user_data["state"] == "AWAITING_TOOL_CONFIRM"
+    assert context.user_data["pending_tool_confirm"] == pending_context
+    assert context.bot.send_message.call_args.kwargs["text"] == bot.messages.get(
+        "tool_confirm_prompt", "en", description="delete-object(id=123)"
+    )
+    bot.llm.resume_tool_call.assert_not_called()
+
+
+async def test_awaiting_tool_confirm_confirm_executes_pending_state_normal(bot):
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    update = _make_update(text="confirm")
+    context = _make_context(
+        user_data={
+            "state": "AWAITING_TOOL_CONFIRM",
+            "pending_tool_confirm": pending_context,
+        }
+    )
+    bot.db.get_user = AsyncMock(return_value=_make_user(bot))
+    bot.llm.resume_tool_call = AsyncMock(return_value="Deleted.")
+
+    await bot.message_handler(update, context)
+
+    bot.llm.resume_tool_call.assert_awaited_once()
+    call_args = bot.llm.resume_tool_call.call_args.args
+    assert call_args[-1] == pending_context
+    assert context.user_data["state"] == "NORMAL"
+    assert "pending_tool_confirm" not in context.user_data
+    assert context.bot.send_message.call_args.kwargs["text"] == "Deleted."
+
+
+async def test_awaiting_tool_confirm_case_insensitive(bot):
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    update = _make_update(text="CONFIRM")
+    context = _make_context(
+        user_data={
+            "state": "AWAITING_TOOL_CONFIRM",
+            "pending_tool_confirm": pending_context,
+        }
+    )
+    bot.db.get_user = AsyncMock(return_value=_make_user(bot))
+    bot.llm.resume_tool_call = AsyncMock(return_value="Deleted.")
+
+    await bot.message_handler(update, context)
+
+    bot.llm.resume_tool_call.assert_awaited_once()
+    assert context.user_data["state"] == "NORMAL"
+
+
+async def test_awaiting_tool_confirm_other_text_cancels(bot):
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    update = _make_update(text="nevermind")
+    context = _make_context(
+        user_data={
+            "state": "AWAITING_TOOL_CONFIRM",
+            "pending_tool_confirm": pending_context,
+        }
+    )
+    bot.db.get_user = AsyncMock(return_value=_make_user(bot))
+
+    await bot.message_handler(update, context)
+
+    bot.llm.resume_tool_call.assert_not_called()
+    assert context.user_data["state"] == "NORMAL"
+    assert "pending_tool_confirm" not in context.user_data
+    assert context.bot.send_message.call_args.kwargs["text"] == bot.messages.get(
+        "tool_confirm_cancelled", "en"
+    )
+
+
+async def test_awaiting_tool_confirm_decrypt_error_sends_decrypt_error(bot):
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    update = _make_update(text="confirm")
+    context = _make_context(
+        user_data={
+            "state": "AWAITING_TOOL_CONFIRM",
+            "pending_tool_confirm": pending_context,
+        }
+    )
+    user = _make_user(bot)
+    user["todoist_token"] = "not-valid-encrypted-data"
+    bot.db.get_user = AsyncMock(return_value=user)
+
+    await bot.message_handler(update, context)
+
+    bot.llm.resume_tool_call.assert_not_called()
+    assert context.user_data["state"] == "NORMAL"
+    assert context.bot.send_message.call_args.kwargs["text"] == bot.messages.get(
+        "decrypt_error", "en"
+    )
+
+
+async def test_confirmation_required_result_chains_to_another_confirmation(bot):
+    update = _make_update(text="confirm")
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    context = _make_context(
+        user_data={
+            "state": "AWAITING_TOOL_CONFIRM",
+            "pending_tool_confirm": pending_context,
+        }
+    )
+    bot.db.get_user = AsyncMock(return_value=_make_user(bot))
+    next_pending_context = {"tool_calls": [{"id": "call-2"}]}
+    bot.llm.resume_tool_call = AsyncMock(
+        return_value=bot.llm.ConfirmationRequired(
+            description="delete-object(id=456)", context=next_pending_context
+        )
+    )
+
+    await bot.message_handler(update, context)
+
+    assert context.user_data["state"] == "AWAITING_TOOL_CONFIRM"
+    assert context.user_data["pending_tool_confirm"] == next_pending_context
+    assert context.bot.send_message.call_args.kwargs["text"] == bot.messages.get(
+        "tool_confirm_prompt", "en", description="delete-object(id=456)"
+    )
+
+
+async def test_sequence_destructive_confirm(bot):
+    update = _make_update(text="delete that task")
+    context = _make_context()
+    bot.db.get_user = AsyncMock(return_value=_make_user(bot))
+    pending_context = {"tool_calls": [{"id": "call-1"}]}
+    bot.llm.process_message = AsyncMock(
+        return_value=bot.llm.ConfirmationRequired(
+            description="delete-object(id=123)", context=pending_context
+        )
+    )
+    await bot.message_handler(update, context)
+    assert context.user_data["state"] == "AWAITING_TOOL_CONFIRM"
+
+    update_confirm = _make_update(text="confirm")
+    bot.llm.resume_tool_call = AsyncMock(return_value="Deleted.")
+    await bot.message_handler(update_confirm, context)
+
+    assert context.user_data["state"] == "NORMAL"
+    bot.llm.resume_tool_call.assert_awaited_once()
+    assert context.bot.send_message.call_args.kwargs["text"] == "Deleted."
 
 
 async def test_start_new_user_sets_awaiting_token(bot):

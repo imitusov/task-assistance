@@ -26,12 +26,15 @@ REQUIRED_KEYS = [
     "decrypt_error",
     "send_error",
     "db_error",
+    "tool_confirm_prompt",
+    "tool_confirm_cancelled",
 ]
 
 PLACEHOLDER_KWARGS = {
     "rate_limit_session": {"retry_time": "x"},
     "rate_limit_week": {"retry_time": "x"},
     "reset_confirmed": {"count": 1},
+    "tool_confirm_prompt": {"description": "delete-object(id=123)"},
 }
 
 
@@ -69,6 +72,13 @@ def test_unknown_lang_falls_back_to_en():
 def test_reset_confirmed_contains_count():
     result = messages.get("reset_confirmed", "en", count=5)
     assert "5" in result
+
+
+def test_tool_confirm_prompt_contains_description():
+    result = messages.get(
+        "tool_confirm_prompt", "en", description="delete-object(id=123)"
+    )
+    assert "delete-object(id=123)" in result
 
 
 @pytest.mark.parametrize("key", REQUIRED_KEYS)

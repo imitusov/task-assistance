@@ -39,6 +39,11 @@ _MESSAGES = {
         "decrypt_error": "There was a problem with your stored token. Please re-register with /token.",
         "send_error": "Something went wrong sending the message.",
         "db_error": "A temporary error occurred. Please try again.",
+        "tool_confirm_prompt": (
+            "This action can't be undone: {description}. "
+            "Type 'confirm' to proceed, or anything else to cancel."
+        ),
+        "tool_confirm_cancelled": "Action cancelled.",
     },
     "ru": {
         "welcome": (
@@ -76,6 +81,11 @@ _MESSAGES = {
         "decrypt_error": "Проблема с сохранённым токеном. Зарегистрируйтесь снова с помощью /token.",
         "send_error": "Не удалось отправить сообщение.",
         "db_error": "Произошла временная ошибка. Попробуйте снова.",
+        "tool_confirm_prompt": (
+            "Это действие нельзя отменить: {description}. "
+            "Напишите 'confirm', чтобы продолжить, или что-нибудь другое для отмены."
+        ),
+        "tool_confirm_cancelled": "Действие отменено.",
     },
 }
 

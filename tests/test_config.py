@@ -51,6 +51,18 @@ def test_optional_vars_absent_use_defaults(monkeypatch):
     assert config.LOG_RETENTION_DAYS == 30
 
 
+def test_destructive_tools_default(monkeypatch):
+    config = _reload_config(monkeypatch, REQUIRED_VARS)
+    assert config.DESTRUCTIVE_TOOLS == {"delete-object"}
+
+
+def test_destructive_tools_overridable_comma_separated(monkeypatch):
+    env = dict(REQUIRED_VARS)
+    env["DESTRUCTIVE_TOOLS"] = "delete-object,close-tasks, reopen-tasks"
+    config = _reload_config(monkeypatch, env)
+    assert config.DESTRUCTIVE_TOOLS == {"delete-object", "close-tasks", "reopen-tasks"}
+
+
 def test_optional_vars_set_as_string_numbers_parsed_as_int(monkeypatch):
     env = dict(REQUIRED_VARS)
     env.update(

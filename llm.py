@@ -1,5 +1,6 @@
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
@@ -8,6 +9,19 @@ import config
 import db
 import mcp
 import messages
+
+
+@dataclass
+class ConfirmationRequired:
+    """Returned by `process_message` instead of an answer string when a
+    destructive tool call (per `config.DESTRUCTIVE_TOOLS`) needs explicit
+    user confirmation before it runs. `context` is an opaque, JSON-shaped
+    dict that the caller must pass unchanged to `resume_tool_call` on
+    confirmation, or simply discard on cancellation (nothing has been
+    persisted or executed yet)."""
+
+    description: str
+    context: dict
 
 _MODEL = config.LLM_MODEL
 _LLM_TIMEOUT = httpx.Timeout(30.0)
@@ -19,13 +33,16 @@ _SYSTEM_PROMPTS = {
     "en": (
         "You are a helpful Todoist assistant. Today's date is {current_date} "
         "(UTC). Help the user manage and answer questions about their Todoist "
-        "tasks using the available tools. Be concise and direct."
+        "tasks using the available tools. Be concise and direct. If a tool "
+        "result indicates an error, read the error and retry with a corrected "
+        "call rather than giving up."
     ),
     "ru": (
         "Ты — полезный ассистент Todoist. Сегодняшняя дата: {current_date} "
         "(UTC). Помогай пользователю управлять задачами Todoist и отвечать на "
         "вопросы о них, используя доступные инструменты. Отвечай кратко и по "
-        "делу."
+        "делу. Если результат инструмента содержит ошибку, прочитай её и "
+        "повтори вызов с исправленными параметрами, а не сдавайся."
     ),
 }
 
@@ -61,6 +78,26 @@ def _strip_thinking(text: str | None) -> str | None:
     return "".join(result).strip()
 
 
+_TRUNCATION_MARKER = "…[truncated]"
+
+
+def _truncate_tool_result(content: str) -> str:
+    cap = config.MAX_TOOL_RESULT_CHARS
+    if len(content) <= cap:
+        return content
+    return content[: cap - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+def _describe_tool_calls(tool_calls: list[dict]) -> str:
+    parts = []
+    for tool_call in tool_calls:
+        name = tool_call["function"]["name"]
+        arguments = json.loads(tool_call["function"]["arguments"])
+        args_str = ", ".join(f"{k}={v}" for k, v in arguments.items())
+        parts.append(f"{name}({args_str})")
+    return "; ".join(parts)
+
+
 def _format_retry_time(seconds: int) -> str:
     seconds = max(seconds, 0)
     days, rem = divmod(seconds, 86400)
@@ -85,12 +122,17 @@ def _extract_token_count(payload: dict) -> int | None:
     return usage.get("total_tokens")
 
 
-async def _call_llm(messages_payload: list[dict], tools: list, user_id: int):
+async def _call_llm(
+    messages_payload: list[dict],
+    tools: list,
+    user_id: int,
+    tool_choice: str = "auto",
+):
     payload = {
         "model": _MODEL,
         "messages": messages_payload,
         "tools": tools,
-        "tool_choice": "auto",
+        "tool_choice": tool_choice,
         # Stable per-user id → NeuralDeep routes the user to the same upstream,
         # keeping the prompt KV-cache warm across turns (faster multi-turn).
         "user": str(user_id),
@@ -133,17 +175,20 @@ async def _run_llm_call(
     language: str,
     turn_start: datetime,
     cleanup_on_failure: bool,
+    tool_choice: str = "auto",
 ) -> tuple[dict | None, str | None]:
     """Makes one LLM call and handles its timeout/429/logging boilerplate.
 
     Returns `(message, None)` on success or `(None, early_return_answer)` on
     timeout or rate limit. `cleanup_on_failure` controls whether
     `delete_turn_tool_results(user_id, turn_start)` runs before an early
-    return — `True` for the second call (tool results already persisted),
-    `False` for the first (nothing to clean up yet).
+    return — `True` once any tool results may already be persisted this turn,
+    `False` for the very first call (nothing to clean up yet).
     """
     try:
-        response, latency_ms = await _call_llm(messages_payload, tools, user_id)
+        response, latency_ms = await _call_llm(
+            messages_payload, tools, user_id, tool_choice=tool_choice
+        )
     except httpx.TimeoutException:
         if cleanup_on_failure:
             await db.delete_turn_tool_results(user_id, turn_start)
@@ -171,55 +216,20 @@ async def _run_llm_call(
     return message, None
 
 
-async def process_message(
+async def _execute_tool_calls(
     user_id: int,
-    user_text: str,
     token: str,
     language: str,
     turn_start: datetime,
-) -> str:
-    turn_started_at = time.monotonic()
-
-    history = await db.get_history(user_id)
-    system_message = _build_system_message(language)
-    user_msg = {"role": "user", "content": user_text}
-    await db.save_user_message(user_id, user_msg)
-    conversation = list(history) + [user_msg]
-    tools = await mcp.get_tools(token)
-
-    message, early_return = await _run_llm_call(
-        "tool_selection",
-        [system_message] + conversation,
-        tools,
-        user_id,
-        language,
-        turn_start,
-        cleanup_on_failure=False,
-    )
-    if early_return is not None:
-        return early_return
-
-    content = message.get("content")
-    tool_calls = message.get("tool_calls")
-
-    if not tool_calls:
-        answer = _strip_thinking(content)
-        await db.save_turn(user_id, {"role": "assistant", "content": answer})
-        await db.log(
-            user_id,
-            "INFO",
-            "bot_response",
-            {"latency_ms": (time.monotonic() - turn_started_at) * 1000},
-        )
-        return answer
-
-    assistant_tool_msg = {
-        "role": "assistant",
-        "content": content,
-        "tool_calls": tool_calls,
-    }
-    conversation.append(assistant_tool_msg)
-
+    tool_calls: list[dict],
+    conversation: list[dict],
+) -> str | None:
+    """Executes each tool call in order, appending `{"role": "tool", ...}`
+    results to `conversation`. Returns `None` on success, or the
+    `tool_failure` message (after the ERROR log + `delete_turn_tool_results`
+    cleanup, Rule 6/14) on the first `mcp.call_tool` / `db.save_tool_result`
+    exception — remaining calls in `tool_calls` are then skipped. An
+    `isError: true` result is not an exception and does not stop the loop."""
     for tool_call in tool_calls:
         name = tool_call["function"]["name"]
         arguments = json.loads(tool_call["function"]["arguments"])
@@ -236,7 +246,7 @@ async def process_message(
         tool_msg = {
             "role": "tool",
             "tool_call_id": tool_call["id"],
-            "content": json.dumps(result),
+            "content": _truncate_tool_result(json.dumps(result)),
         }
 
         try:
@@ -253,25 +263,175 @@ async def process_message(
             "tool_call",
             {"tool": name, "params": arguments, "latency_ms": tool_latency_ms},
         )
+    return None
 
-    message2, early_return2 = await _run_llm_call(
+
+async def _run_tool_loop(
+    user_id: int,
+    token: str,
+    language: str,
+    turn_start: datetime,
+    turn_started_at: float,
+    conversation: list[dict],
+    tools: list,
+    system_message: dict,
+    start_round: int,
+    requested_tools: bool,
+) -> str | ConfirmationRequired:
+    """The bounded agentic tool loop, shared by `process_message` (starting
+    at round 1) and `resume_tool_call` (continuing at `round_num + 1` after a
+    confirmed destructive call has already been executed)."""
+
+    async def _final_answer(content: str | None) -> str:
+        answer = _strip_thinking(content)
+        await db.save_turn(user_id, {"role": "assistant", "content": answer})
+        await db.log(
+            user_id,
+            "INFO",
+            "bot_response",
+            {"latency_ms": (time.monotonic() - turn_started_at) * 1000},
+        )
+        return answer
+
+    for round_num in range(start_round, config.MAX_TOOL_ROUNDS + 1):
+        message, early_return = await _run_llm_call(
+            f"tool_round_{round_num}",
+            [system_message] + conversation,
+            tools,
+            user_id,
+            language,
+            turn_start,
+            cleanup_on_failure=requested_tools,
+        )
+        if early_return is not None:
+            return early_return
+
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+
+        if not tool_calls:
+            return await _final_answer(content)
+
+        destructive = [
+            tc for tc in tool_calls if tc["function"]["name"] in config.DESTRUCTIVE_TOOLS
+        ]
+        if destructive:
+            assistant_tool_msg = {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": tool_calls,
+            }
+            return ConfirmationRequired(
+                description=_describe_tool_calls(destructive),
+                context={
+                    "conversation": list(conversation),
+                    "assistant_tool_msg": assistant_tool_msg,
+                    "tool_calls": tool_calls,
+                    "tools": tools,
+                    "round_num": round_num,
+                },
+            )
+
+        requested_tools = True
+        assistant_tool_msg = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+        }
+        await db.save_assistant_tool_call(user_id, assistant_tool_msg)
+        conversation.append(assistant_tool_msg)
+
+        failure = await _execute_tool_calls(
+            user_id, token, language, turn_start, tool_calls, conversation
+        )
+        if failure is not None:
+            return failure
+
+    # Exhaustion: the model still wanted tools after MAX_TOOL_ROUNDS — force
+    # one final answer-only call rather than returning bare retry narration.
+    message, early_return = await _run_llm_call(
         "answer_generation",
         [system_message] + conversation,
         tools,
         user_id,
         language,
         turn_start,
-        cleanup_on_failure=True,
+        cleanup_on_failure=requested_tools,
+        tool_choice="none",
     )
-    if early_return2 is not None:
-        return early_return2
+    if early_return is not None:
+        return early_return
 
-    answer = _strip_thinking(message2.get("content"))
-    await db.save_turn(user_id, {"role": "assistant", "content": answer})
-    await db.log(
+    return await _final_answer(message.get("content"))
+
+
+async def process_message(
+    user_id: int,
+    user_text: str,
+    token: str,
+    language: str,
+    turn_start: datetime,
+) -> str | ConfirmationRequired:
+    turn_started_at = time.monotonic()
+
+    history = await db.get_history(user_id)
+    system_message = _build_system_message(language)
+    user_msg = {"role": "user", "content": user_text}
+    await db.save_user_message(user_id, user_msg)
+    conversation = list(history) + [user_msg]
+    tools = await mcp.get_tools(token)
+
+    return await _run_tool_loop(
         user_id,
-        "INFO",
-        "bot_response",
-        {"latency_ms": (time.monotonic() - turn_started_at) * 1000},
+        token,
+        language,
+        turn_start,
+        turn_started_at,
+        conversation,
+        tools,
+        system_message,
+        start_round=1,
+        requested_tools=False,
     )
-    return answer
+
+
+async def resume_tool_call(
+    user_id: int,
+    token: str,
+    language: str,
+    turn_start: datetime,
+    context: dict,
+) -> str | ConfirmationRequired:
+    """Executes a previously-deferred destructive tool call (per
+    `ConfirmationRequired.context`) after explicit user confirmation, then
+    resumes the bounded tool loop from the next round."""
+    turn_started_at = time.monotonic()
+
+    conversation = context["conversation"]
+    assistant_tool_msg = context["assistant_tool_msg"]
+    tool_calls = context["tool_calls"]
+    tools = context["tools"]
+    round_num = context["round_num"]
+    system_message = _build_system_message(language)
+
+    await db.save_assistant_tool_call(user_id, assistant_tool_msg)
+    conversation.append(assistant_tool_msg)
+
+    failure = await _execute_tool_calls(
+        user_id, token, language, turn_start, tool_calls, conversation
+    )
+    if failure is not None:
+        return failure
+
+    return await _run_tool_loop(
+        user_id,
+        token,
+        language,
+        turn_start,
+        turn_started_at,
+        conversation,
+        tools,
+        system_message,
+        start_round=round_num + 1,
+        requested_tools=True,
+    )

@@ -33,6 +33,12 @@ on explicitly-set vars, never a developer's local `.env`.)
 - `MAX_HISTORY_MESSAGES: int` — default `20`
 - `CONVERSATION_RETENTION_DAYS: int` — default `7`
 - `LOG_RETENTION_DAYS: int` — default `30`
+- `MAX_TOOL_RESULT_CHARS: int` — default `8000` (cap on serialized tool-result
+  length before `llm.py` stores it via `db.save_tool_result`; consumed by
+  `llm._truncate_tool_result`)
+- `MAX_TOOL_ROUNDS: int` — default `3` (cap on tool-requesting LLM calls per
+  turn in `llm.process_message`'s bounded agentic loop; one additional forced
+  `tool_choice:"none"` call is allowed on top of this cap — see [[llm.py]])
 
 **Optional (str, with defaults):**
 - `LLM_MODEL: str` — default `"qwen3.6-35b-a3b"` (lowercase — NeuralDeep keys
@@ -44,6 +50,15 @@ on explicitly-set vars, never a developer's local `.env`.)
   The legacy `api.todoist.net/rest/v2` host is dead/sunset — verified
   2026-06-24: `.net` does not resolve, `rest/v2` returns HTTP 410, the unified
   `api.todoist.com/api/v1/projects` returns 401 unauthenticated)
+
+**Optional (set[str], comma-separated env string, with default):**
+- `DESTRUCTIVE_TOOLS: set[str]` — default `{"delete-object"}`. Parsed by
+  splitting `os.environ.get("DESTRUCTIVE_TOOLS", "delete-object")` on `,` and
+  stripping whitespace per item (empty items dropped) — `"a,b, c"` →
+  `{"a", "b", "c"}`. Consumed by `llm._run_tool_loop` (task 14) to decide
+  which tool-requesting LLM responses must pause for explicit user
+  confirmation before any `mcp.call_tool` runs — see [[llm.py]] /
+  `ConfirmationRequired`.
 
 All modules must import these names from `config` — never read
 `os.environ` directly.
@@ -68,7 +83,8 @@ descriptions. No internal dependencies.
 (`retry_time`), `llm_timeout`, `tool_failure`, `reset_prompt`,
 `reset_confirmed` (`count`), `reset_confirmed_empty`, `reset_cancelled`,
 `refresh_confirmed`, `group_chat_rejected`, `help_text`, `please_wait`,
-`decrypt_error`, `send_error`, `db_error`.
+`decrypt_error`, `send_error`, `db_error`, `tool_confirm_prompt`
+(`description` — task 14), `tool_confirm_cancelled` (task 14).
 
 **Constraint:** `send_error` is < 100 chars in both languages (enforced by
 test, not by `get` itself — callers must not assume truncation).
@@ -262,6 +278,14 @@ connection was created; test fixtures don't need extra codec setup)
   share a timestamp). The only place trimming happens.
 - `save_tool_result(user_id: int, tool_content: dict) -> None` — inserts a
   row with `role = tool_content["role"]`. Never trims.
+- `save_assistant_tool_call(user_id: int, content: dict) -> None` — inserts a
+  row with `role = content["role"]` (`"assistant"`, with `tool_calls` set and
+  `content` typically `null`). Never trims. Persists the intermediate
+  assistant tool-call wrapper from `llm.py`'s bounded tool loop so a `"tool"`
+  row is never reloaded without its preceding `"assistant"`/`tool_calls` row
+  — same no-trim insert shape as `save_user_message`/`save_tool_result`, kept
+  as its own named function per the task-13 contract rather than reusing one
+  of those names.
 - `delete_turn_tool_results(user_id: int, since: datetime) -> None` —
   deletes `role = "tool"` rows where `created_at >= since` (inclusive by
   design). Safe with zero matching rows.
@@ -389,34 +413,121 @@ already being implemented/tested in [[db.py]]. Resolved in favor of
 `db.log` so events actually reach Grafana; treated the task file's
 omission as an oversight.
 
+**`ConfirmationRequired` (dataclass, task 14)**
+- Fields: `description: str` (human-readable, built by `_describe_tool_calls`
+  from only the *destructive* tool calls in the round — e.g.
+  `"delete-object(id=123, type=task)"`), `context: dict` (opaque resume
+  state; JSON-shaped, never executed or persisted before confirmation).
+  `context` keys: `conversation` (the full message list as of right before
+  this round, a fresh `list(...)` copy — safe to mutate further),
+  `assistant_tool_msg` (the `{"role":"assistant", "content", "tool_calls"}`
+  wrapper for this round, NOT yet saved/appended), `tool_calls` (the round's
+  *full* tool-call list — destructive and non-destructive together; they
+  execute as one batch on confirm, since the model expects a result for
+  every `tool_call.id` it emitted), `tools` (the MCP tool list, snapshotted
+  so resume doesn't need to re-call `mcp.get_tools`), `round_num` (so resume
+  continues at `round_num + 1`). Caller (`bot.py`) stores `context` verbatim
+  and passes it back to `resume_tool_call` unchanged on confirmation, or
+  simply discards it on cancellation — nothing has touched the DB or
+  Todoist yet, so cancellation has nothing to undo.
+
 **Public**
-- `process_message(user_id: int, user_text: str, token: str, language: str, turn_start: datetime) -> str`
+- `process_message(user_id: int, user_text: str, token: str, language: str, turn_start: datetime) -> str | ConfirmationRequired`
   (async) — `turn_start` must be the exact timezone-aware `datetime` the
   caller (`bot.py`) captured after lock acquisition; every cleanup call
   inside this function passes that same object through unchanged (never a
   freshly generated timestamp) — verified by identity (`is`), not just
-  equality, in `tests/test_llm.py`. Step order matches the contract exactly:
-  `db.get_history` → build system message → build user message → ALWAYS
-  `db.save_user_message` (before any LLM call, including all early-return
-  paths) → `mcp.get_tools` → first LLM call (`tool_choice="auto"`, 30s
-  timeout) → no-tool-calls path (`db.save_turn` once, return answer) or
-  tool-calls path (execute every tool call via `mcp.call_tool` +
-  `db.save_tool_result`, second LLM call, `db.save_turn` once, return
-  answer). On `mcp.call_tool` failure or `db.save_tool_result` failure:
-  logs `tool_call` at ERROR, calls `db.delete_turn_tool_results(user_id,
-  turn_start)`, returns `messages.get("tool_failure", language)` —
-  remaining tool calls in that turn are skipped, `db.save_turn` is never
-  reached. On HTTP 429 from either LLM call: logs `rate_limit` at WARNING
-  (never ERROR) and returns `rate_limit_session`/`rate_limit_week`
-  (selected by the `X-Window` response header; anything other than the
-  literal string `"week"` is treated as `"session"`); the *second*-call 429
-  path additionally calls `delete_turn_tool_results` first (the first-call
-  429 path does not, since no tool results exist yet to clean up). On
-  `httpx.TimeoutException` from either LLM call: returns `llm_timeout`
-  (logged at WARNING via the `llm_call` event with `error: "timeout"`); the
-  second-call path additionally calls `delete_turn_tool_results` first.
+  equality, in `tests/test_llm.py`. Step order: `db.get_history` → build
+  system message → build user message → ALWAYS `db.save_user_message`
+  (before any LLM call, including all early-return paths) → `mcp.get_tools`
+  → delegates to `_run_tool_loop(..., start_round=1, requested_tools=False)`
+  for the **bounded agentic tool loop** (task 13, replaces v1's rigid single
+  round; task 14 adds the destructive-call intercept inside it — see below).
   `db.save_user_message` always happens; the error message itself is never
   saved to history (Rule 14).
+- `resume_tool_call(user_id: int, token: str, language: str, turn_start: datetime, context: dict) -> str | ConfirmationRequired`
+  (async, task 14) — called by `bot.py` after the user replies `"confirm"`
+  while in `STATE_AWAITING_TOOL_CONFIRM`; `context` is exactly the
+  `ConfirmationRequired.context` dict from the original `process_message` (or
+  a prior `resume_tool_call`) call. Persists `context["assistant_tool_msg"]`
+  via `db.save_assistant_tool_call` (deferred until now — this is the point
+  the v1-bug-fix wrapper-persistence from task 13 actually happens for a
+  confirmed round) and appends it to `context["conversation"]`; executes
+  *all* of `context["tool_calls"]` via `_execute_tool_calls` (Rule 6/14
+  cleanup semantics apply exactly as in the loop — an exception from
+  `mcp.call_tool`/`db.save_tool_result` returns `tool_failure` after
+  `db.delete_turn_tool_results(user_id, turn_start)`); on success, resumes
+  `_run_tool_loop(..., start_round=context["round_num"] + 1,
+  requested_tools=True)`. Rebuilds `system_message` from the current
+  `language`/date rather than threading it through `context` (it's cheap and
+  deterministic, and avoids one more thing to serialize). Can itself return
+  another `ConfirmationRequired` if a later round in the same resumed turn
+  also requests a destructive tool — `bot.py` re-enters
+  `STATE_AWAITING_TOOL_CONFIRM` rather than assuming exactly one confirmation
+  per turn.
+
+**`_run_tool_loop` / `_execute_tool_calls` (private, task 14 — factored out
+of the single-`process_message` implementation from task 13 specifically so
+`process_message` and `resume_tool_call` can share the loop body without
+duplicating it):**
+- `_run_tool_loop(user_id, token, language, turn_start, turn_started_at, conversation, tools, system_message, start_round: int, requested_tools: bool) -> str | ConfirmationRequired`
+  (async) — for `round_num` in `start_round..config.MAX_TOOL_ROUNDS`, one LLM
+  call per round (`tool_choice="auto"`, 30s timeout, stage
+  `f"tool_round_{round_num}"`, `cleanup_on_failure=requested_tools` — i.e.
+  `False` only until the first round that actually executes a tool, `True`
+  from then on, including across a resume since `resume_tool_call` always
+  passes `requested_tools=True`). No `tool_calls` in that round's response →
+  final answer (`db.save_turn` once, log `bot_response`, return `content`) —
+  this can happen on *any* round, not just the last; the loop simply returns
+  as soon as a round comes back answer-only. Has `tool_calls` → **first**
+  checks whether any tool name is in `config.DESTRUCTIVE_TOOLS` (task 14): if
+  so, returns a `ConfirmationRequired` immediately, *before* persisting the
+  assistant wrapper or calling `mcp.call_tool` for any tool in that round
+  (destructive or not — see `ConfirmationRequired` above on why the whole
+  round is held together). Otherwise persists the assistant tool-call
+  wrapper (`role:"assistant"`, `content`, `tool_calls`) via the no-trim
+  `db.save_assistant_tool_call` AND appends it to the in-memory
+  `conversation` list (the v1 bug task 13 fixes: that wrapper was never
+  persisted, so a reloaded turn went `user → tool → assistant-answer` with
+  no `assistant`/`tool_calls` row between — malformed per the OpenAI/Qwen
+  tool format), sets `requested_tools = True`, then delegates execution of
+  every tool call in the round to `_execute_tool_calls`. **Exhaustion:** if
+  the loop runs all rounds through `MAX_TOOL_ROUNDS` and the last one still
+  requested tools, one final call is made with `tool_choice="none"` (stage
+  `"answer_generation"`, same `cleanup_on_failure=requested_tools`),
+  `db.save_turn`, return its `content` — never bare retry narration (Error
+  Rule 16). At most `MAX_TOOL_ROUNDS + 1` LLM calls per turn (counting from
+  `start_round=1`; fewer if entered via `resume_tool_call` at a later
+  round). On HTTP 429 from any call: logs `rate_limit` at WARNING (never
+  ERROR) and returns `rate_limit_session`/`rate_limit_week` (selected by the
+  `X-Window` response header; anything other than the literal string
+  `"week"` is treated as `"session"`). On `httpx.TimeoutException` from any
+  call: returns `llm_timeout` (logged at WARNING via the `llm_call` event
+  with `error: "timeout"`).
+- `_execute_tool_calls(user_id, token, language, turn_start, tool_calls: list[dict], conversation: list[dict]) -> str | None`
+  (async) — executes each tool call in `tool_calls` in order, appending its
+  `{"role": "tool", ...}` result to `conversation` (mutated in place).
+  Per call: `mcp.call_tool` (EXCEPTION → log `tool_call` at ERROR,
+  `db.delete_turn_tool_results(user_id, turn_start)`, return `tool_failure`
+  immediately — remaining calls in the batch are skipped); serialize +
+  `_truncate_tool_result` (task 12); `db.save_tool_result` (EXCEPTION → same
+  cleanup + `tool_failure`); log `tool_call` at INFO. An `isError: true`
+  result from `mcp.call_tool` is **not** an exception (`mcp.call_tool` only
+  raises on transport/JSON-RPC failure) — it's appended like any other
+  result so the model can see the error and retry with a corrected call next
+  round (the system-prompt line below exists for exactly this). Returns
+  `None` if every call in the batch succeeded. Shared verbatim by
+  `_run_tool_loop` (a normal, non-destructive round) and `resume_tool_call`
+  (a confirmed destructive round) — the only difference between those two
+  callers is *when* the assistant wrapper gets persisted, not how the tool
+  calls themselves run.
+- `_describe_tool_calls(tool_calls: list[dict]) -> str` (task 14) — builds
+  the human-readable `ConfirmationRequired.description`: for each call,
+  `f"{name}({k1}={v1}, {k2}={v2}, ...)"` from the parsed `arguments` dict,
+  joined with `"; "` across multiple calls. Not specified by the contract
+  beyond "human-readable" — this exact format is this implementation's own
+  choice, mirroring `_format_retry_time`'s precedent of an undocumented
+  display format.
 
 **Private helpers** (no public wrapper needed solely for these, so they're
 unit-tested directly):
@@ -427,7 +538,12 @@ unit-tested directly):
   are never shown to the user or stored, so `messages.py`'s
   user-facing-string rule doesn't apply). Unknown language silently falls
   back to `"en"`, consistent with `messages.get`'s own fallback. Date comes
-  from `_today_str()`.
+  from `_today_str()`. (Task 13) `_SYSTEM_PROMPTS["en"]`/`["ru"]` each carry
+  an added trailing sentence instructing the model to read tool errors and
+  retry with a corrected call instead of giving up — needed so the bounded
+  tool loop's retry-on-`isError` behavior actually gets used by the model
+  under `-noreason`/non-reasoning decoding, rather than the model just
+  narrating the retry as if it were the final answer.
 - `_today_str() -> str` — `datetime.now(timezone.utc).strftime("%Y-%m-%d")`,
   factored out specifically so tests can `monkeypatch.setattr(llm,
   "_today_str", lambda: "...")` instead of subclassing `datetime`.
@@ -451,10 +567,21 @@ unit-tested directly):
   this exact format is this implementation's own choice.
 - `_extract_token_count(payload: dict) -> int | None` — `payload["usage"]
   ["total_tokens"]` if `usage` is present and truthy, else `None`.
-- `_call_llm(messages_payload: list[dict], tools: list, user_id: int) -> tuple[httpx.Response, float]`
+- `_truncate_tool_result(content: str) -> str` — caps a serialized
+  (`json.dumps`) tool-result string at `config.MAX_TOOL_RESULT_CHARS`. Content
+  at or under the cap is returned unchanged. Over the cap, it's sliced to
+  `cap - len(_TRUNCATION_MARKER)` and the module-level marker `"…[truncated]"`
+  is appended, so the result is always exactly `cap` chars long. Called in
+  `process_message`'s tool-call loop on `json.dumps(result)` before building
+  the `{"role": "tool", ...}` message — the truncated string is both saved
+  via `db.save_tool_result` and what's forwarded to the second LLM call in
+  the same turn (single source of truth, no separate "stored" vs "sent"
+  copies). No-op on `tool_failure`/error paths (Rule 6 unaffected — those
+  paths never reach this call).
+- `_call_llm(messages_payload: list[dict], tools: list, user_id: int, tool_choice: str = "auto") -> tuple[httpx.Response, float]`
   (async) — POSTs to `f"{config.NEURALDEEP_API_URL}/chat/completions"`
   with `{"model": _MODEL, "messages": ..., "tools": ..., "tool_choice":
-  "auto", "user": str(user_id)}` under `httpx.AsyncClient(timeout=_LLM_TIMEOUT)`
+  tool_choice, "user": str(user_id)}` under `httpx.AsyncClient(timeout=_LLM_TIMEOUT)`
   (30s, plain
   `httpx.Timeout(30.0)` positional form — see the [[mcp.py]] deviation
   note on why `total=` isn't used here either). Returns the raw
@@ -471,18 +598,20 @@ unit-tested directly):
   `test_qwen_tools.py`); overridable via the `LLM_MODEL` env var.
 - `_handle_rate_limit(user_id: int, response: httpx.Response, language: str) -> str`
   (async) — shared by both the first- and second-call 429 branches.
-- `_run_llm_call(stage, messages_payload, tools, user_id, language, turn_start, cleanup_on_failure) -> tuple[dict | None, str | None]`
+- `_run_llm_call(stage, messages_payload, tools, user_id, language, turn_start, cleanup_on_failure, tool_choice="auto") -> tuple[dict | None, str | None]`
   (async) — added during a post-implementation cleanup pass (2026-06-24) to
-  deduplicate `process_message`'s two near-identical LLM-call blocks
-  (timeout handling, 429 handling, success logging were repeated almost
-  verbatim for the `"tool_selection"` and `"answer_generation"` stages).
-  Wraps one `_call_llm` call: on success returns `(message, None)`; on
-  timeout or 429 returns `(None, early_return_answer)` after logging.
-  `cleanup_on_failure` is `False` for the first call (nothing to clean up
-  yet) and `True` for the second (calls `db.delete_turn_tool_results(
-  user_id, turn_start)` before either failure return) — this flag is the
-  one behavioral difference the contract draws between the two calls'
-  failure paths, so it's threaded through explicitly rather than inferred.
+  deduplicate `process_message`'s near-identical LLM-call blocks (timeout
+  handling, 429 handling, success logging). Wraps one `_call_llm` call: on
+  success returns `(message, None)`; on timeout or 429 returns `(None,
+  early_return_answer)` after logging. `cleanup_on_failure` calls
+  `db.delete_turn_tool_results(user_id, turn_start)` before either failure
+  return when `True` — `_run_tool_loop` (task 13/14) passes its
+  `requested_tools` flag for every call, in-loop or exhaustion (`False`
+  only until the first round that actually executes a tool; `True` from
+  then on, including across a `resume_tool_call`). `tool_choice` (task 13,
+  default `"auto"`) is forwarded straight to `_call_llm`; `_run_tool_loop`
+  passes `"none"` only for the exhaustion final call, forcing a text-only
+  response so the loop can't recurse past `MAX_TOOL_ROUNDS + 1` calls.
 
 ## bot.py
 
@@ -500,10 +629,15 @@ already-deleted message is unreliable; using direct `send_message`
 everywhere keeps the pattern uniform across the whole module.
 
 **State constants:** `STATE_NORMAL = "NORMAL"`, `STATE_AWAITING_TOKEN =
-"AWAITING_TOKEN"`, `STATE_AWAITING_RESET = "AWAITING_RESET"`. Stored in
+"AWAITING_TOKEN"`, `STATE_AWAITING_RESET = "AWAITING_RESET"`,
+`STATE_AWAITING_TOOL_CONFIRM = "AWAITING_TOOL_CONFIRM"` (task 14). Stored in
 `context.user_data["state"]` (absent == `STATE_NORMAL`). Per-user lock in
 `context.user_data["lock"]` (`_get_lock(context)` —
-`context.user_data.setdefault("lock", asyncio.Lock())`).
+`context.user_data.setdefault("lock", asyncio.Lock())`). Task 14 also uses
+`context.user_data["pending_tool_confirm"]` to hold the in-flight
+`llm.ConfirmationRequired.context` dict across the two messages — in-memory
+only, lost on restart, consistent with the existing states (per the task's
+own "default" sub-decision; no separate persistence layer was added).
 
 **Handlers** (all: `_reject_if_group` first, then lock-contention check,
 then `await lock.acquire()` / `try` / `finally: lock.release()`):
@@ -544,12 +678,35 @@ then `await lock.acquire()` / `try` / `finally: lock.release()`):
   `"confirm"` case-insensitive/stripped → `db.clear_user_history`,
   `reset_confirmed`/`reset_confirmed_empty` by count, else
   `reset_cancelled`; state → `NORMAL`; return either way) →
+  **`AWAITING_TOOL_CONFIRM` branch (task 14, mirrors the `AWAITING_RESET`
+  branch's two-step shape):** pops `pending_tool_confirm` from `user_data`
+  and sets state → `NORMAL` unconditionally first (so any exception below
+  can't leave the state machine stuck waiting for a second confirm).
+  `"confirm"` (case-insensitive/stripped) AND a pending context exists →
+  `crypto.decrypt_token` (`ValueError` → `decrypt_error`, return) →
+  keep-typing task → `llm.resume_tool_call(user_id, token, stored_lang,
+  turn_start, pending_context)` → `_cancel_keep_typing` (`finally`) →
+  `_send_confirmation_or_answer` (so a *chained* `ConfirmationRequired` from
+  the resumed loop re-enters `AWAITING_TOOL_CONFIRM` rather than being
+  assumed impossible). Anything else (including no pending context, a
+  defensive case that shouldn't occur in normal operation) →
+  `tool_confirm_cancelled`, nothing executed. Return either way — →
   `language.resolve` (+ `update_language` or `touch_user`) → accidental-token
   check (deletes the message, swallowing any deletion error silently — no
   `token_deletion_failed` here, that message is specific to
   `_handle_token_input`'s own deletion step) → `crypto.decrypt_token`
   (`ValueError` → `decrypt_error`) → keep-typing task → `llm.process_message`
-  → `_cancel_keep_typing` (always, via `finally`) → `_send_with_truncation`.
+  → `_cancel_keep_typing` (always, via `finally`) →
+  `_send_confirmation_or_answer`.
+- `_send_confirmation_or_answer(context, chat_id, lang, result: str |
+  llm.ConfirmationRequired) -> None` (async, task 14) — the single render
+  point shared by both `llm.process_message`'s and `llm.resume_tool_call`'s
+  result: `isinstance(result, llm.ConfirmationRequired)` → sets state →
+  `AWAITING_TOOL_CONFIRM`, stores `result.context` as
+  `pending_tool_confirm`, sends `tool_confirm_prompt` (with
+  `description=result.description`) in `lang`, returns. Otherwise delegates
+  to the existing `_send_with_truncation(context.bot, chat_id, result,
+  lang)` unchanged — a plain answer is rendered exactly as before task 14.
 - `_handle_token_input(update, context)` (async) — lock already held by
   the caller (`message_handler`/`_process_message`), does not touch the
   lock itself. Language: `context.user_data.get("detected_language")`,

@@ -313,6 +313,59 @@ async def test_save_tool_result_inserts_tool_row_without_trim(db_conn, conn):
     assert rows[0]["role"] == "tool"
 
 
+# --- save_assistant_tool_call -------------------------------------------------
+
+
+async def test_save_assistant_tool_call_inserts_assistant_row_without_trim(
+    db_conn, conn
+):
+    await _insert_user(conn, 1)
+    await db_conn.save_assistant_tool_call(
+        1,
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {}}],
+        },
+    )
+    rows = await conn.fetch("SELECT role FROM conversations WHERE user_id = 1")
+    assert len(rows) == 1
+    assert rows[0]["role"] == "assistant"
+
+
+async def test_save_assistant_tool_call_never_trims(db_conn, conn):
+    await _insert_user(conn, 1)
+    for i in range(25):
+        await db_conn.save_assistant_tool_call(
+            1, {"role": "assistant", "content": None, "tool_calls": [{"id": f"c{i}"}]}
+        )
+    rows = await conn.fetch("SELECT id FROM conversations WHERE user_id = 1")
+    assert len(rows) == 25
+
+
+async def test_save_assistant_tool_call_then_save_tool_result_well_formed_history(
+    db_conn, conn
+):
+    await _insert_user(conn, 1)
+    await db_conn.save_user_message(1, {"role": "user", "content": "hi"})
+    await db_conn.save_assistant_tool_call(
+        1,
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {}}],
+        },
+    )
+    await db_conn.save_tool_result(
+        1, {"role": "tool", "tool_call_id": "call-1", "content": "result"}
+    )
+    await db_conn.save_turn(1, {"role": "assistant", "content": "done"})
+    history = await db_conn.get_history(1)
+    roles = [m["role"] for m in history]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    assert history[1].get("tool_calls") is not None
+
+
 # --- delete_turn_tool_results -------------------------------------------------
 
 

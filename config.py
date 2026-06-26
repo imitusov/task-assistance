@@ -17,6 +17,13 @@ LOG_LEVEL = os.environ["LOG_LEVEL"]
 
 MCP_TOOLS_TTL = int(os.environ.get("MCP_TOOLS_TTL", 86400))
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", 20))
+MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", 8000))
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", 3))
+DESTRUCTIVE_TOOLS = {
+    name.strip()
+    for name in os.environ.get("DESTRUCTIVE_TOOLS", "delete-object").split(",")
+    if name.strip()
+}
 CONVERSATION_RETENTION_DAYS = int(os.environ.get("CONVERSATION_RETENTION_DAYS", 7))
 LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", 30))
 
