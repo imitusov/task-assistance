@@ -431,6 +431,51 @@ def test_strip_thinking_passes_through_none(llm):
     assert llm._strip_thinking(None) is None
 
 
+# --- leaked tool-call markup -------------------------------------------------
+
+
+def test_strip_tool_call_markup_removes_closed_block(llm):
+    text = "Here you go.\n<tool_call>\n<function=find-activity></function>\n</tool_call>"
+    assert llm._strip_tool_call_markup(text) == "Here you go."
+
+
+def test_strip_tool_call_markup_removes_unclosed_block(llm):
+    text = "Let me try.\n<tool_call>\n<function=find-tasks>"
+    assert llm._strip_tool_call_markup(text) == "Let me try."
+
+
+def test_strip_tool_call_markup_no_block_unchanged(llm):
+    assert llm._strip_tool_call_markup("plain answer") == "plain answer"
+
+
+def test_strip_tool_call_markup_passes_through_none(llm):
+    assert llm._strip_tool_call_markup(None) is None
+
+
+async def test_final_answer_strips_leaked_tool_call_markup(llm, monkeypatch):
+    response = _llm_response(
+        _message_payload(content="The oldest task is X.\n<tool_call><function=find-activity></function></tool_call>")
+    )
+    _patch_llm_client(llm, monkeypatch, [response])
+
+    answer = await llm.process_message(1, "hi", "tok", "en", TURN_START)
+
+    assert answer == "The oldest task is X."
+    assert "<tool_call>" not in answer
+
+
+async def test_final_answer_only_markup_returns_tool_failure_no_save_turn(llm, monkeypatch):
+    response = _llm_response(
+        _message_payload(content="<tool_call><function=find-activity></function></tool_call>")
+    )
+    _patch_llm_client(llm, monkeypatch, [response])
+
+    answer = await llm.process_message(1, "hi", "tok", "en", TURN_START)
+
+    assert answer == llm.messages.get("tool_failure", "en")
+    llm.db.save_turn.assert_not_called()
+
+
 def test_format_retry_time_includes_days_and_hours(llm):
     assert llm._format_retry_time(90000) == "1d 1h"
 
@@ -566,7 +611,7 @@ async def test_truncated_content_is_what_is_forwarded_to_model(llm, monkeypatch)
 
 
 def test_config_max_tool_result_chars_default(llm):
-    assert llm.config.MAX_TOOL_RESULT_CHARS == 8000
+    assert llm.config.MAX_TOOL_RESULT_CHARS == 16000
 
 
 def test_config_max_tool_result_chars_overridable(monkeypatch):
@@ -583,7 +628,7 @@ def test_config_max_tool_result_chars_overridable(monkeypatch):
 
 
 def test_config_max_tool_rounds_default(llm):
-    assert llm.config.MAX_TOOL_ROUNDS == 3
+    assert llm.config.MAX_TOOL_ROUNDS == 5
 
 
 async def test_wrapper_persisted_for_tool_round(llm, monkeypatch):

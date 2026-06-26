@@ -17,8 +17,8 @@ LOG_LEVEL = os.environ["LOG_LEVEL"]
 
 MCP_TOOLS_TTL = int(os.environ.get("MCP_TOOLS_TTL", 86400))
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", 20))
-MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", 8000))
-MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", 3))
+MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", 16000))
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", 5))
 DESTRUCTIVE_TOOLS = {
     name.strip()
     for name in os.environ.get("DESTRUCTIVE_TOOLS", "delete-object").split(",")

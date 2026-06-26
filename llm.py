@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,6 +77,23 @@ def _strip_thinking(text: str | None) -> str | None:
                 result.append(text[i])
             i += 1
     return "".join(result).strip()
+
+
+_TOOL_CALL_MARKUP = re.compile(r"<tool_call>.*?</tool_call>|<tool_call>.*", re.DOTALL)
+
+
+def _strip_tool_call_markup(text: str | None) -> str | None:
+    """Remove leaked text-format tool-call blocks from a final answer.
+
+    Some models (notably non-reasoning Qwen on the forced `tool_choice="none"`
+    exhaustion call) emit a Hermes/XML `<tool_call>...</tool_call>` block as
+    plain text in `content` when they want a tool but structured calls are
+    unavailable. That markup must never reach the user. Handles both
+    well-formed and unclosed (trailing) blocks.
+    """
+    if text is None:
+        return None
+    return _TOOL_CALL_MARKUP.sub("", text).strip()
 
 
 _TRUNCATION_MARKER = "…[truncated]"
@@ -283,7 +301,11 @@ async def _run_tool_loop(
     confirmed destructive call has already been executed)."""
 
     async def _final_answer(content: str | None) -> str:
-        answer = _strip_thinking(content)
+        answer = _strip_tool_call_markup(_strip_thinking(content))
+        if not answer:
+            # The model produced only a leaked tool-call attempt, no real
+            # answer — don't persist an empty/markup turn; surface a failure.
+            return messages.get("tool_failure", language)
         await db.save_turn(user_id, {"role": "assistant", "content": answer})
         await db.log(
             user_id,

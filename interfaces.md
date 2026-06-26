@@ -33,10 +33,10 @@ on explicitly-set vars, never a developer's local `.env`.)
 - `MAX_HISTORY_MESSAGES: int` — default `20`
 - `CONVERSATION_RETENTION_DAYS: int` — default `7`
 - `LOG_RETENTION_DAYS: int` — default `30`
-- `MAX_TOOL_RESULT_CHARS: int` — default `8000` (cap on serialized tool-result
+- `MAX_TOOL_RESULT_CHARS: int` — default `16000` (cap on serialized tool-result
   length before `llm.py` stores it via `db.save_tool_result`; consumed by
   `llm._truncate_tool_result`)
-- `MAX_TOOL_ROUNDS: int` — default `3` (cap on tool-requesting LLM calls per
+- `MAX_TOOL_ROUNDS: int` — default `5` (cap on tool-requesting LLM calls per
   turn in `llm.process_message`'s bounded agentic loop; one additional forced
   `tool_choice:"none"` call is allowed on top of this cap — see [[llm.py]])
 
@@ -560,6 +560,15 @@ unit-tested directly):
   `<think>` blocks (the contract gates this feature on that script's
   result), and the user confirmed (2026-06-23) to implement it
   unconditionally rather than skip it; safe no-op on plain text.
+- `_strip_tool_call_markup(text: str | None) -> str | None` (fix 2026-06-27) —
+  regex-removes Hermes/XML `<tool_call>...</tool_call>` blocks (closed or
+  unclosed/trailing) from a final answer, then `.strip()`s. `None` passes
+  through. Applied in `_run_tool_loop._final_answer` together with
+  `_strip_thinking`; if the result is empty (model emitted only a leaked
+  tool-call attempt — seen live on the `tool_choice:"none"` exhaustion call
+  with non-reasoning Qwen), `_final_answer` returns `messages.get(
+  "tool_failure", language)` and does NOT `save_turn` (no empty/markup turn is
+  persisted). Raw tool-call markup must never reach the user.
 - `_format_retry_time(seconds: int) -> str` — turns a `Retry-After` second
   count into a compact human string (`"1d 1h"`, `"45s"`, etc.) for the
   `retry_time` kwarg of `rate_limit_session`/`rate_limit_week`. Not

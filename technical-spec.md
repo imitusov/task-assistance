@@ -481,8 +481,8 @@ if missing. All modules import from `config` — never `os.environ` directly.
 - `MCP_SERVER_URL` → str, default `https://ai.todoist.net/mcp`
 - `TODOIST_BASE_URL` → str, default `https://api.todoist.com/api/v1` (REST base
   for token validation; the legacy `api.todoist.net/rest/v2` host is dead)
-- `MAX_TOOL_ROUNDS` → int, default 3 (bounded agentic tool loop, see llm.py)
-- `MAX_TOOL_RESULT_CHARS` → int, default 8000 (tool-result truncation cap to
+- `MAX_TOOL_ROUNDS` → int, default 5 (bounded agentic tool loop, see llm.py)
+- `MAX_TOOL_RESULT_CHARS` → int, default 16000 (tool-result truncation cap to
   bound history/context size, see db.py)
 
 `config` auto-loads a local `.env` at import via `dotenv.load_dotenv(
@@ -641,7 +641,7 @@ context for ~`MAX_HISTORY_MESSAGES` turns regardless of how small the user's
 messages are. Observed in v1 — a 77.8KB `find-activity` result drove an
 unrelated next question to ~79K tokens and a 24s near-failure. The binding
 constraint is *context tokens*, not rows. Mitigation, in order of preference:
-(1) cap each tool result at `MAX_TOOL_RESULT_CHARS` (config, default `8000`)
+(1) cap each tool result at `MAX_TOOL_RESULT_CHARS` (config, default `16000`)
 by truncating with an explicit `…[truncated]` marker *before* it is stored
 (applied by the `llm.py` caller per its contract, so the oversized blob never
 enters history); (2) optionally, trim `get_history`/`save_turn` by cumulative
@@ -746,6 +746,16 @@ Pre-Development Verification). Read the answer from `content` only;
 `_strip_thinking` remains as a defensive no-op (handles nested/incomplete
 blocks) in case a future model inlines them.
 
+**Leaked tool-call markup (fix 2026-06-27):** the final answer is also passed
+through `_strip_tool_call_markup`, which removes Hermes/XML
+`<tool_call>...</tool_call>` blocks (closed or unclosed). Some models —
+notably non-reasoning Qwen on the forced `tool_choice:"none"` exhaustion call —
+emit a tool call as plain text in `content` when they want a tool but structured
+calls are unavailable; that markup must never reach the user. If stripping the
+markup leaves the answer empty (the model produced *only* a leaked tool-call
+attempt), return `tool_failure` and do NOT `save_turn` (no empty/markup turn is
+persisted). Observed live 2026-06-27.
+
 **Rate limit:** On HTTP 429: read `X-Window`, `Retry-After`, log `rate_limit`
 at WARNING (never ERROR), return message from `messages.py`. No retry.
 
@@ -759,7 +769,7 @@ call another tool, but a fixed two-call flow gives it nowhere to go — so its
 retry *narration* ("Let me try a different search…") becomes the final answer
 and the user gets a non-answer. The contract is therefore an explicit loop:
 the model may take **up to `MAX_TOOL_ROUNDS` rounds** of tool calls (config,
-default `3`) before a final answer is forced. A tool result carrying
+default `5`) before a final answer is forced. A tool result carrying
 `isError: true` is a normal input fed back to the model (not a hard failure) —
 only an *exception* from `mcp.call_tool`/`save_tool_result` (transport/DB
 failure) triggers the `tool_failure` early return.
