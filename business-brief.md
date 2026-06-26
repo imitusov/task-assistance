@@ -81,9 +81,9 @@ Grafana reads logs from database → dashboards update
 | Component | Choice | Reason |
 |---|---|---|
 | Chat interface | Telegram Bot (python-telegram-bot) | User already uses Telegram |
-| LLM | Qwen3.6-35b-a3b | Excellent tool calling, fast MoE architecture |
+| LLM | `qwen3.6-35b-a3b` | Excellent tool calling, fast MoE architecture. Model id is case-sensitive/lowercase — the capitalised form returns HTTP 401. A `qwen3.6-35b-a3b-noreason` variant disables chain-of-thought. |
 | LLM API | `https://api.neuraldeep.ru/v1` | Available endpoint, OpenAI-compatible format |
-| Task data | Todoist MCP server (`https://ai.todoist.net/mcp`) | Official tool definitions with full schemas |
+| Task data | Todoist MCP server (`https://ai.todoist.net/mcp`) | Official tool definitions with full schemas. Note: the MCP host (`ai.todoist.net`) is distinct from the REST host used for token validation (`api.todoist.com/api/v1`) — they are not interchangeable. |
 | Database | PostgreSQL (Railway managed) | Handles concurrent users, JSONB for flexible storage |
 | DB migrations | Alembic | Version-controlled schema changes, safe deploys |
 | Encryption | Fernet (cryptography library) | Symmetric encryption for tokens at rest |
@@ -266,11 +266,13 @@ While in `AWAITING_TOKEN` state:
   restarts
 
 **Token submission:**
-The bot makes a single GET request to the Todoist API to validate the token.
-If validation returns HTTP 200, the token is accepted. If it fails for any
-reason (wrong token, network error, any other status), the user is told the
+The bot makes a single GET request to the Todoist REST API
+(`GET https://api.todoist.com/api/v1/projects`, the unified v1 API — NOT the
+retired `rest/v2` path, and NOT the `ai.todoist.net` MCP host) to validate the
+token. If validation returns HTTP 200, the token is accepted. If it fails for
+any reason (wrong token, network error, any other status), the user is told the
 token is invalid and asked to try again in their detected language. There is
-no retry limit in v1.
+no retry limit in v1. The exact base URL is configurable via `TODOIST_BASE_URL`.
 
 Once accepted, the token is encrypted and saved, state returns to `NORMAL`,
 and the user is confirmed connected.
@@ -353,17 +355,39 @@ described under Telegram Commands.
 The LLM receives the conversation history plus tool definitions on every turn.
 It either calls one or more tools, or answers directly without tools.
 
-**When tools are called:** All tool calls in the response are executed before
-the LLM is called a second time to formulate the final answer. This handles
-cases where the LLM decides to call multiple tools in one turn (for example,
-fetching tasks and productivity stats simultaneously).
+**When tools are called (bounded loop):** All tool calls in a response are
+executed, then the model is called again with the results. If the model asks
+for more tools (for example, to retry after a tool reported a bad query, or to
+gather follow-up data), this repeats — up to a small bounded number of rounds
+(`MAX_TOOL_ROUNDS`, default 3) — before a final answer is forced. This replaces
+v1's rigid single-round design, which left the model unable to recover from a
+tool error and caused it to *narrate* a retry ("Let me try a different
+search…") as the final answer instead of actually retrying.
 
-If any tool call fails during a multi-tool turn, the entire turn is aborted
-immediately and the user receives an error message in their language. Partial
-results from successful tool calls in the same turn are discarded.
+**Tool errors vs. tool failures:** a tool that runs and reports a problem in its
+result (e.g. Todoist rejecting an invalid filter) is normal feedback — it is
+returned to the model so it can correct itself within the loop. Only a genuine
+*failure* (the call itself errors out, or the result can't be saved) aborts the
+turn with an error message in the user's language; partial results from that
+turn are discarded.
 
 **When no tools are called:** The LLM's response is used directly as the
-answer. No second LLM call is made.
+answer.
+
+**Confirmation for irreversible actions:** any action that is hard to undo —
+deleting a task, bulk-completing, clearing data — requires explicit user
+confirmation before it executes, the same way history `/reset` already does.
+v1's task-level destructive tool calls (e.g. `delete-object`) currently execute
+on inferred intent alone; this is a scope gap to close.
+
+**Chosen mechanism (decided 2026-06-26): in-conversation two-step confirm**,
+mirroring `/reset`. When the model wants to call a destructive tool, the bot
+does NOT execute it immediately — it describes what will happen ("Delete task
+'Buy milk'?") and waits for the user to reply `confirm` in a follow-up message.
+Confirm → the action runs; anything else → it's cancelled. This is enforced in
+code (a bot state + an interception of destructive tool calls), not left to the
+model's discretion, so it can't be skipped even by a non-reasoning model. The
+set of destructive tools is configurable.
 
 ---
 

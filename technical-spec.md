@@ -35,6 +35,30 @@ Both scripts must be run manually before any application code is written.
 Both must exit with code 0 to be considered passing. A non-zero exit code
 blocks development — do not proceed until both pass.
 
+**Why this section is load-bearing (lessons learned 2026-06-25/26):** the most
+expensive bugs in v1 came not from faulty logic but from *unverified
+assumptions about external services baked straight into the code* — a model id
+written from memory with the wrong casing (`Qwen3.6-35b-a3b` → HTTP 401; the
+key requires lowercase `qwen3.6-35b-a3b`), a token-validation endpoint pointed
+at a dead host/version (`api.todoist.net/rest/v2` — `.net` doesn't resolve and
+`rest/v2` is HTTP 410 Gone; the live API is `api.todoist.com/api/v1`), and
+"thinking tokens" assumed to be inline `<think>` blocks when the provider
+actually returns reasoning in a separate `reasoning_content` field. Every one of
+these is the kind of thing a pre-dev probe catches in minutes and a code review
+never will. **Therefore: pin every external constant to a value confirmed by a
+probe — never to a value from memory or docs alone.**
+
+**Mandatory: pin-and-verify every external constant before coding.** The probes
+below must not just confirm "it works" — they must print and lock down the exact
+values the code will hardcode/configure:
+- The exact LLM **model id** string accepted by the key (case-sensitive).
+- Every **endpoint URL** the bot calls (LLM, Todoist MCP, Todoist REST token
+  validation), each confirmed reachable with the expected status.
+- The exact **response shape** the code will parse (where tool calls live,
+  where reasoning lives, the SSE framing).
+Record the confirmed values in `interfaces.md`/config so later modules consume
+verified constants, never guesses.
+
 **Partial failure is failure.** If `test_qwen_tools.py` confirms tool calling
 works but thinking tokens are present and unhandled, that is not a pass —
 document the finding, update the spec's thinking token section, and re-run.
@@ -46,16 +70,28 @@ Each script must print a clear `PASS` or `FAIL` summary line as its last
 output so the result is unambiguous in CI logs or terminal output.
 
 ### test_qwen_tools.py
-Verify `api.neuraldeep.ru/v1` accepts OpenAI tool calling. Send a request
-with a dummy tool and assert response contains `tool_calls`. Verify whether
-`<think>...</think>` blocks appear in responses — document position relative
-to `tool_calls`. Print full raw response. Exit 0 on pass, exit 1 on any
-assertion failure, unexpected response format, or network error.
+Verify `NEURALDEEP_API_URL` accepts OpenAI tool calling. Send a request with a
+dummy tool and assert response contains `tool_calls`. **Pin the exact model id**
+(case-sensitive — `qwen3.6-35b-a3b`, with the `-noreason` variant available to
+disable reasoning). Determine **where reasoning appears**: confirmed it is a
+separate `reasoning_content` field, NOT inline `<think>...</think>` in
+`content` — so `_strip_thinking` is a safe no-op for this provider, and the
+final answer is read from `content` only. Print full raw response. Exit 0 on
+pass, exit 1 on any assertion failure, unexpected response format, or network
+error.
 
 ### test_mcp_auth.py
-Verify Todoist MCP server accepts Bearer token auth and returns SSE tool
+Verify Todoist MCP server (`MCP_SERVER_URL`, default
+`https://ai.todoist.net/mcp`) accepts Bearer token auth and returns SSE tool
 definitions. Assert at least one tool with `name` and `inputSchema`. Exit 0
 on pass, exit 1 on auth failure, SSE parse failure, or network error.
+
+### test_todoist_rest.py (token validation endpoint)
+Verify the REST base used for token validation (`TODOIST_BASE_URL`, default
+`https://api.todoist.com/api/v1`). A `GET {base}/projects` with no auth must
+return 401 (endpoint live, needs a token), confirming the host and API version
+are current. This guards against the dead `api.todoist.net/rest/v2` host that
+silently broke all onboarding in v1. Exit 0/1 as above.
 
 ---
 
@@ -270,12 +306,24 @@ via a session-scoped pytest fixture.
 - `save_tool_result` never called
 - Answer returned matches LLM response content
 
-**Tool calling path:**
-- One `tool_call` → `mcp.call_tool` called once, second LLM call made,
+**Tool calling path:** (cases below describe a single tool round — round 1
+tools, round 2 answer. The bounded loop adds the multi-round cases that follow.)
+- One `tool_call` → `mcp.call_tool` called once, follow-up LLM call made,
   `save_turn` called
 - Two `tool_calls` → `mcp.call_tool` called twice, both results appended
-  before second LLM call
+  before the follow-up LLM call
 - `save_tool_result` called once per tool call
+
+**Bounded tool loop (per the updated llm.py contract):**
+- A second-round response with more `tool_calls` → those tools execute and a
+  further LLM call is made (up to `MAX_TOOL_ROUNDS`)
+- A tool result with `isError: true` is appended and fed back (NOT treated as a
+  `tool_failure`); the loop continues so the model can retry
+- Reaching `MAX_TOOL_ROUNDS` with the model still requesting tools → one final
+  answer is forced; the user never receives bare retry narration
+- An EXCEPTION from `mcp.call_tool`/`save_tool_result` → `delete_turn_tool_results`
+  + `tool_failure` (distinct from an `isError` result)
+- Tool results longer than `MAX_TOOL_RESULT_CHARS` are truncated before storage
 - `save_turn` called exactly once after second LLM response
 
 **`turn_start` propagation:**
@@ -428,6 +476,18 @@ if missing. All modules import from `config` — never `os.environ` directly.
 - `MAX_HISTORY_MESSAGES` → int, default 20
 - `CONVERSATION_RETENTION_DAYS` → int, default 7
 - `LOG_RETENTION_DAYS` → int, default 30
+- `LLM_MODEL` → str, default `qwen3.6-35b-a3b` (lowercase; capitalised form
+  returns HTTP 401)
+- `MCP_SERVER_URL` → str, default `https://ai.todoist.net/mcp`
+- `TODOIST_BASE_URL` → str, default `https://api.todoist.com/api/v1` (REST base
+  for token validation; the legacy `api.todoist.net/rest/v2` host is dead)
+- `MAX_TOOL_ROUNDS` → int, default 3 (bounded agentic tool loop, see llm.py)
+- `MAX_TOOL_RESULT_CHARS` → int, default 8000 (tool-result truncation cap to
+  bound history/context size, see db.py)
+
+`config` auto-loads a local `.env` at import via `dotenv.load_dotenv(
+override=False)` — already-set env vars (Railway-injected, test-monkeypatched)
+win, and a missing `.env` is a no-op.
 
 ---
 
@@ -559,16 +619,41 @@ excluding `role = "system"`. Raw JSONB objects passed directly to LLM.
 Inserts user message row. Does NOT trim. Called at the start of every turn
 including early returns, so user context is preserved for next turn.
 
+`save_assistant_tool_call(user_id: int, content: dict) → None`
+Inserts an intermediate assistant tool-call wrapper row (`role:"assistant"`,
+`content` possibly null, `tool_calls` present). Does NOT trim — only the final
+`save_turn` trims. Required so reloaded history is well-formed: every
+`role:"tool"` row must be preceded by its matching `assistant`/`tool_calls`
+message. v1 kept this in memory only, leaving orphan tool rows in stored
+history. (Implementation may instead generalize an existing no-trim insert
+rather than add a distinctly-named function — the contract requirement is that
+the wrapper is persisted, no-trim, in order.)
+
 `save_turn(user_id: int, assistant_content: dict) → None`
 Inserts assistant row. Runs `MAX_HISTORY_MESSAGES` trim exactly once
 atomically. THE ONLY location where trimming occurs. Called exactly once
 per successful turn. `MAX_HISTORY_MESSAGES` counts all roles (user,
 assistant, tool) — tool-heavy turns consume more slots.
 
+**History size budget (design correction 2026-06-26).** Trimming by *row
+count* alone is insufficient: a single large tool result can dominate the
+context for ~`MAX_HISTORY_MESSAGES` turns regardless of how small the user's
+messages are. Observed in v1 — a 77.8KB `find-activity` result drove an
+unrelated next question to ~79K tokens and a 24s near-failure. The binding
+constraint is *context tokens*, not rows. Mitigation, in order of preference:
+(1) cap each tool result at `MAX_TOOL_RESULT_CHARS` (config, default `8000`)
+by truncating with an explicit `…[truncated]` marker *before* it is stored
+(applied by the `llm.py` caller per its contract, so the oversized blob never
+enters history); (2) optionally, trim `get_history`/`save_turn` by cumulative
+size in addition to row count. Item (1) is the required fix; item (2) is an
+allowed enhancement. `/reset` remains the user-facing escape hatch.
+
 `save_tool_result(user_id: int, tool_content: dict) → None`
-Inserts tool result row. Does not trim. On failure: caller must call
-`delete_turn_tool_results` and return `tool_failure`. Do not continue to
-second LLM call with unpersisted tool results.
+Inserts tool result row (the caller has already truncated oversized content to
+`MAX_TOOL_RESULT_CHARS`). Does not trim. On EXCEPTION (DB failure): caller
+must call `delete_turn_tool_results` and return `tool_failure`. A tool result
+whose payload has `isError: true` is valid data, not a failure — it is stored
+normally and fed back to the model (see the llm.py bounded tool loop).
 
 `delete_turn_tool_results(user_id: int, since: datetime) → None`
 Deletes `role = "tool"` rows where `created_at >= since` (boundary
@@ -655,13 +740,29 @@ Returns plain strings only. No Telegram knowledge.
 
 **System prompts:** EN and RU templates with `{current_date}`. Never stored.
 
-**Thinking tokens:** Strip `<think>...</think>` from responses if confirmed
-by `test_qwen_tools.py`. Handle nested and incomplete blocks.
+**Thinking tokens:** The provider returns reasoning in a separate
+`reasoning_content` field, not inline `<think>...</think>` in `content` (see
+Pre-Development Verification). Read the answer from `content` only;
+`_strip_thinking` remains as a defensive no-op (handles nested/incomplete
+blocks) in case a future model inlines them.
 
 **Rate limit:** On HTTP 429: read `X-Window`, `Retry-After`, log `rate_limit`
 at WARNING (never ERROR), return message from `messages.py`. No retry.
 
 **`token_count`:** From `response.usage.total_tokens`. Log `null` if absent.
+
+**Bounded agentic tool loop (design correction 2026-06-26).** v1 hardcoded a
+single tool round (one tool-selection call → execute → one answer call). That
+is too rigid: when a tool returns an *error result* (e.g. Todoist rejects an
+invalid filter with `isError: true`), the model wants to correct itself and
+call another tool, but a fixed two-call flow gives it nowhere to go — so its
+retry *narration* ("Let me try a different search…") becomes the final answer
+and the user gets a non-answer. The contract is therefore an explicit loop:
+the model may take **up to `MAX_TOOL_ROUNDS` rounds** of tool calls (config,
+default `3`) before a final answer is forced. A tool result carrying
+`isError: true` is a normal input fed back to the model (not a hard failure) —
+only an *exception* from `mcp.call_tool`/`save_tool_result` (transport/DB
+failure) triggers the `tool_failure` early return.
 
 **process_message(user_id, user_text, token, language, turn_start) → str**
 
@@ -673,42 +774,80 @@ at WARNING (never ERROR), return message from `messages.py`. No retry.
 4. `db.save_user_message(user_id, user_msg)` — always, before any LLM call
 5. Append to in-memory history
 6. `mcp.get_tools(token)`
-7. LLM call with `tool_choice: "auto"`, 30s timeout. Log `llm_call`
-   (stage: `"tool_selection"`, token_count)
-8. HTTP 429 → rate limit, return message
-9. Timeout → log WARNING, return `llm_timeout`
-10. Strip thinking tokens if applicable
-11. No tool calls → `db.save_turn`, log `bot_response`, return answer
-12. Tool calls:
-    a. Append assistant tool-call message to in-memory history
-    b. For each tool call:
-       - `mcp.call_tool`. On failure: log ERROR,
-         `db.delete_turn_tool_results(user_id, turn_start)`,
-         return `tool_failure`
-       - Serialize result: `json.dumps(result)`
-       - Build tool message dict
-       - `db.save_tool_result`. On failure: log ERROR,
-         `db.delete_turn_tool_results(user_id, turn_start)`,
-         return `tool_failure`
-       - Append to in-memory history
-       - Log `tool_call` with name, params, latency_ms
-    c. Second LLM call with `tool_choice: "auto"`, 30s timeout. Log
-       `llm_call` (stage: `"answer_generation"`, token_count)
-    d. HTTP 429 → `db.delete_turn_tool_results(user_id, turn_start)`,
-       return rate limit message
-    e. Timeout → `db.delete_turn_tool_results(user_id, turn_start)`,
-       return `llm_timeout`
-    f. Strip thinking tokens
-    g. `db.save_turn(user_id, assistant_dict)`
-    h. Log `bot_response` with total latency
-    i. Return answer text
+7. Loop, for `round` in `1..MAX_TOOL_ROUNDS` (so at most `MAX_TOOL_ROUNDS`
+   tool-requesting calls + 1 forced final call = `MAX_TOOL_ROUNDS + 1` LLM
+   calls per turn; a "round" is one response that requests tools):
+   a. LLM call with `tool_choice: "auto"`, 30s timeout. Log `llm_call`
+      (stage `"tool_round_<n>"`, token_count).
+   b. HTTP 429 → if any tool results were persisted this turn,
+      `db.delete_turn_tool_results(user_id, turn_start)`; return rate-limit
+      message.
+   c. Timeout → log WARNING; same cleanup as (b); return `llm_timeout`.
+   d. No `tool_calls` in the response → this is the final answer:
+      `db.save_turn`, log `bot_response` with total latency, return answer
+      (read from `content`).
+   e. Has `tool_calls`:
+      - **Persist the assistant tool-call wrapper** (`role:"assistant"`,
+        `content`, `tool_calls`) via a no-trim insert (see db.py) AND append it
+        to in-memory history. This is required so reloaded history is
+        well-formed — every `role:"tool"` row must follow its matching
+        `assistant`/`tool_calls` message. (v1 only kept this in memory, leaving
+        orphan tool rows in stored history.)
+      - For each call: `mcp.call_tool` (on EXCEPTION: log ERROR,
+        `db.delete_turn_tool_results(user_id, turn_start)`, return
+        `tool_failure`); serialize with `json.dumps(result)` and **truncate to
+        `MAX_TOOL_RESULT_CHARS`** (see db.py) before building the tool message;
+        `db.save_tool_result` (on EXCEPTION: same cleanup + `tool_failure`);
+        append to history; log `tool_call` (name, params, latency_ms). A result
+        with `isError: true` is NOT an exception — it is appended like any other
+        and the loop continues so the model can react/retry.
+8. **Exhaustion** — if the loop completes `MAX_TOOL_ROUNDS` and the last
+   response still requested tools, make ONE final call with
+   `tool_choice: "none"` (tools disabled) so the model must produce a text
+   answer from what it has. Log `llm_call` (stage `"answer_generation"`).
+   `db.save_turn`, log `bot_response`, return that answer. Never leave the user
+   with bare retry narration. (Same 429/timeout handling as 7b/7c.)
+
+Every cleanup call passes the exact `turn_start` received by `process_message`,
+never a fresh timestamp.
+
+**System prompt addition:** instruct the model that when a tool returns an
+error, it should read the error and try a corrected call rather than giving up
+or narrating — important because the `-noreason` model won't reason its way to a
+retry on its own.
 
 ---
 
 ### bot.py
 
 **States** (in-memory, lost on restart):
-`NORMAL`, `AWAITING_TOKEN`, `AWAITING_RESET`
+`NORMAL`, `AWAITING_TOKEN`, `AWAITING_RESET`, `AWAITING_TOOL_CONFIRM`
+
+**Destructive-action confirmation** (`AWAITING_TOOL_CONFIRM`, decided
+2026-06-26). Irreversible tool calls require an in-conversation two-step
+confirm, mirroring `/reset` — enforced in code, not left to the model. Flow:
+1. During the llm.py tool loop, before executing a tool whose name is in the
+   configurable `DESTRUCTIVE_TOOLS` set (default: `delete-object`), the loop
+   stops and `process_message` returns a **confirmation-required result**
+   (not a plain answer) carrying the pending tool call(s) and a human-readable
+   description. (This relaxes llm.py's "returns plain strings only" rule:
+   `process_message` now returns either an answer string OR a structured
+   confirmation request — still Telegram-agnostic; `bot.py` renders it.)
+2. `bot.py` stores the pending call(s) + the context needed to resume in
+   `context.user_data`, sets state `AWAITING_TOOL_CONFIRM`, and sends a
+   confirmation prompt ("Delete task 'X'? Reply `confirm`") in the user's lang.
+3. Next message while `AWAITING_TOOL_CONFIRM`:
+   - `"confirm"` (stripped, case-insensitive) → execute the pending tool(s),
+     resume answer generation, `save_turn`, return answer; state `NORMAL`.
+   - anything else → cancel, discard the pending call(s), send a cancellation
+     message; state `NORMAL`.
+
+Open sub-decisions for implementation: (a) where to hold the in-flight
+conversation across the two messages — in-memory `user_data` (lost on restart,
+consistent with the other states) is the default; (b) confirm multiple
+destructive calls in one turn together (recommended) vs. one-by-one; (c) new
+`messages.py` keys: `tool_confirm_prompt`, `tool_confirm_cancelled`. New config:
+`DESTRUCTIVE_TOOLS` (set of tool names).
 
 **Per-user lock pattern** (ALL handlers):
 ```
@@ -773,7 +912,8 @@ recursively). Both fail: log stdout only.
    `language.detect` on available text, else `"en"`. Overwriting on each
    `/start`/`/token` intentional. Cleared only on success.
 2. Delete token message. Failure → `token_deletion_failed`, continue
-3. Validate (`GET /rest/v2/projects`):
+3. Validate (`GET {config.TODOIST_BASE_URL}/projects`, default
+   `https://api.todoist.com/api/v1/projects` — NOT the dead `rest/v2` path):
    - 200 → valid
    - Non-200 → `token_invalid`, keep `AWAITING_TOKEN`, return
    - Network exception → `token_network_error`, keep `AWAITING_TOKEN`,
@@ -941,8 +1081,12 @@ Avg `latency_ms` > 10000 in 15min → degradation.
 3. Token decryption → `decrypt_error`, prompt `/token`
 4. HTTP 429 → WARNING, rate limit message, no retry
 5. LLM timeout → `llm_timeout`
-6. MCP failure or `save_tool_result` failure →
-   `delete_turn_tool_results`, `tool_failure`, discard partial results
+6. MCP call or `save_tool_result` raising an EXCEPTION (transport/DB failure)
+   → `delete_turn_tool_results`, `tool_failure`, discard partial results.
+   NOTE: a tool result carrying `isError: true` in its payload is NOT an
+   exception — it is valid data, stored and fed back to the model so it can
+   retry within the bounded tool loop (see llm.py / Rule 16). Do not conflate
+   "the tool ran and reported a problem" with "the call failed."
 7. `send_message` failure → `send_error` via direct `bot.send_message`.
    Both fail → stdout only
 8. Token deletion failure → `token_deletion_failed`, continue
@@ -955,6 +1099,9 @@ Avg `latency_ms` > 10000 in 15min → degradation.
 14. Early return → user message saved, tool results cleaned up, error
     message not saved to history
 15. `db.get_user` exception → log ERROR, `db_error` in detected language
+16. Tool-loop exhaustion → if the model still wants tools after
+    `MAX_TOOL_ROUNDS`, force one final answer call (or return the last text);
+    never send the user bare retry narration with no result.
 
 ---
 
